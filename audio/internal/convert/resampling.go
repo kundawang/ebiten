@@ -101,8 +101,14 @@ type Resampling struct {
 	from            int
 	to              int
 	bitDepthInBytes int
-	pos             int64
-	srcBlock        int64
+	// quality selects the interpolation kernel. ResampleQualityDefault and
+	// ResampleQualityBalanced reproduce the historical kernel sample for sample.
+	quality ResampleQuality
+	// kernel is the precomputed polyphase table for the polypath kernels. It is
+	// nil for the fast and balanced kernels, which evaluate on the fly.
+	kernel   *polyphaseKernel
+	pos      int64
+	srcBlock int64
 	// lastReadSrcBlock is the last block read completely or through EOF.
 	// It is -1 before the first block is read. Its value is ignored when
 	// lastReadSrcBlockValid is false.
@@ -121,23 +127,14 @@ type Resampling struct {
 
 // NewResampling returns a stream that converts the sample rate of source.
 // length is the length of source in bytes. A negative length indicates the length is unknown.
+//
+// The interpolation kernel is [ResampleQualityBalanced], matching the historical
+// implementation bit for bit. Use [NewResamplingWithQuality] to select another kernel.
 func NewResampling(source io.Reader, length int64, from, to int, bitDepthInBytes int) *Resampling {
-	if length < 0 {
-		length = -1
+	r, err := newResamplingWithQuality(source, length, from, to, bitDepthInBytes, ResampleQualityDefault)
+	if err != nil {
+		panic(err)
 	}
-	r := &Resampling{
-		source:                source,
-		declaredSrcLength:     length,
-		from:                  from,
-		bitDepthInBytes:       bitDepthInBytes,
-		to:                    to,
-		srcBlock:              -1,
-		lastReadSrcBlock:      -1,
-		lastReadSrcBlockValid: true,
-		srcBufL:               map[int64][]float64{},
-		srcBufR:               map[int64][]float64{},
-	}
-	r.derivedSrcLength.Store(-1)
 	return r
 }
 
@@ -299,6 +296,21 @@ func (r *Resampling) src(i int64) (float64, float64, error) {
 }
 
 func (r *Resampling) at(t int64) (float64, float64, error) {
+	switch r.quality {
+	case ResampleQualityFast:
+		return r.atLinear(t)
+	case ResampleQualityHighFidelity:
+		// The table was resolved and stored by the constructor, so the hot path
+		// takes no lock and performs no map lookup.
+		return r.atPolyphase(t, r.kernel)
+	default:
+		// ResampleQualityDefault and ResampleQualityBalanced use the historical
+		// Hann-windowed, 17-tap sinc kernel evaluated on the fly.
+		return r.atBalanced(t)
+	}
+}
+
+func (r *Resampling) atBalanced(t int64) (float64, float64, error) {
 	windowSize := 8.0
 	tInSrc := float64(t) * float64(r.from) / float64(r.to)
 	startN := max(int64(tInSrc-windowSize), 0)
