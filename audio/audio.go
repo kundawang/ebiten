@@ -34,6 +34,15 @@
 // When multiple players play, mixing is automatically done.
 // Note that too many players may cause distortion.
 //
+// A stream may carry more or fewer than two channels: NewPlayerWithChannels and
+// NewPlayerF32WithChannels create players for mono and surround sources. A ChannelMixMatrix
+// maps such a source's channels onto the two device channels, with per-coefficient gains,
+// scalar gain, optional auto-normalization, muting (a zero coefficient) and phase inversion
+// (a negative coefficient). A context also carries a master ChannelMixMatrix applied after
+// every player's own matrix. Players and contexts without a matrix keep the original stereo
+// behavior, and the mixed output is always clamped to the representable range instead of
+// overflowing.
+//
 // For the simplest example to play sound, see the wav package in the examples.
 package audio
 
@@ -45,6 +54,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hajimehoshi/ebiten/v2/audio/internal/convert"
@@ -71,6 +81,16 @@ type Context struct {
 	ready      bool
 
 	playingPlayers map[*playerImpl]struct{}
+
+	// allPlayers tracks every player created by this context, including players that are not
+	// playing, so that a change of the context's master channel mix matrix reaches all of
+	// them. Entries of closed players are removed when the player is closed.
+	allPlayers map[*playerImpl]struct{}
+
+	// masterMixState is the context's master channel mixing state applied after every
+	// player's own matrix. It is an immutable value replaced atomically, so channel mixers
+	// can observe updates without locking the context.
+	masterMixState atomic.Pointer[convert.MixState]
 
 	m sync.Mutex
 	// cond is signalled under m when a player is added to playingPlayers or when the context is
@@ -114,8 +134,10 @@ func NewContext(sampleRate int) *Context {
 		sampleRate:     sampleRate,
 		playerFactory:  newPlayerFactory(sampleRate),
 		playingPlayers: map[*playerImpl]struct{}{},
+		allPlayers:     map[*playerImpl]struct{}{},
 	}
 	c.cond = sync.NewCond(&c.m)
+	c.storeMasterMixState(defaultMasterMixState())
 	theContext = c
 
 	h := getHook()
@@ -281,6 +303,20 @@ func (c *Context) removePlayingPlayer(p *playerImpl) {
 	c.m.Unlock()
 }
 
+// addPlayer registers a player so that master channel mix matrix changes reach it.
+func (c *Context) addPlayer(p *playerImpl) {
+	c.m.Lock()
+	c.allPlayers[p] = struct{}{}
+	c.m.Unlock()
+}
+
+// removePlayer unregisters a player after it is closed.
+func (c *Context) removePlayer(p *playerImpl) {
+	c.m.Lock()
+	delete(c.allPlayers, p)
+	c.m.Unlock()
+}
+
 func (c *Context) onSuspend() error {
 	// A Context must not call playerImpl's functions with a lock, or this causes a deadlock (#2737).
 	// Copy the playerImpls and iterate them without a lock.
@@ -412,13 +448,38 @@ type Player struct {
 func (c *Context) NewPlayer(src io.Reader) (*Player, error) {
 	_, seekable := src.(io.Seeker)
 	f32Src := convert.NewFloat32BytesReaderFromInt16BytesReader(src)
-	pi, err := c.playerFactory.newPlayer(c, f32Src, seekable, src, bitDepthInBytesFloat32)
+	pi, err := c.playerFactory.newPlayer(c, f32Src, seekable, src, bitDepthInBytesFloat32, channelCount)
 	if err != nil {
 		return nil, err
 	}
 
 	p := &Player{p: pi}
 
+	p.cleanup = runtime.AddCleanup(p, (*playerImpl).finalize, p.p)
+
+	return p, nil
+}
+
+// NewPlayerWithChannels creates a new player for a signed 16bit little-endian PCM stream whose
+// interleaved frames carry sourceChannels channels.
+//
+// sourceChannels is one for a mono source, two for stereo, and larger values for surround
+// layouts (up to eight). The stream's layout must match the source channel count of the
+// [ChannelMixMatrix] applied to the player. When no matrix is applied, only a stereo source
+// plays as before; other layouts must set a matrix before the player reads the source.
+//
+// Apart from the channel count, NewPlayerWithChannels follows the same rules as [Context.NewPlayer].
+func (c *Context) NewPlayerWithChannels(src io.Reader, sourceChannels int) (*Player, error) {
+	if sourceChannels <= 0 || sourceChannels > convert.MaxChannels {
+		return nil, fmt.Errorf("audio: source channel count must be in the range [1, %d] but was %d", convert.MaxChannels, sourceChannels)
+	}
+	_, seekable := src.(io.Seeker)
+	pi, err := c.playerFactory.newPlayer(c, src, seekable, src, bitDepthInBytesInt16, sourceChannels)
+	if err != nil {
+		return nil, err
+	}
+
+	p := &Player{p: pi}
 	p.cleanup = runtime.AddCleanup(p, (*playerImpl).finalize, p.p)
 
 	return p, nil
@@ -446,7 +507,33 @@ func (c *Context) NewPlayer(src io.Reader) (*Player, error) {
 // A Player for 32bit float must be used with 32bit float version of audio APIs, like vorbis.DecodeF32 or audio.NewInfiniteLoopF32, not vorbis.DecodeWithoutResampling or audio.NewInfiniteLoop.
 func (c *Context) NewPlayerF32(src io.Reader) (*Player, error) {
 	_, seekable := src.(io.Seeker)
-	pi, err := c.playerFactory.newPlayer(c, src, seekable, src, bitDepthInBytesFloat32)
+	pi, err := c.playerFactory.newPlayer(c, src, seekable, src, bitDepthInBytesFloat32, channelCount)
+	if err != nil {
+		return nil, err
+	}
+
+	p := &Player{p: pi}
+	p.cleanup = runtime.AddCleanup(p, (*playerImpl).finalize, p.p)
+
+	return p, nil
+}
+
+// NewPlayerF32WithChannels creates a new player for a 32bit float little-endian PCM stream
+// whose interleaved frames carry sourceChannels channels.
+//
+// sourceChannels is one for a mono source, two for stereo, and larger values for surround
+// layouts (up to eight). The stream's layout must match the source channel count of the
+// [ChannelMixMatrix] applied to the player. When no matrix is applied, only a stereo source
+// plays as before; other layouts must set a matrix before the player reads the source.
+//
+// Apart from the channel count, NewPlayerF32WithChannels follows the same rules as
+// [Context.NewPlayerF32].
+func (c *Context) NewPlayerF32WithChannels(src io.Reader, sourceChannels int) (*Player, error) {
+	if sourceChannels <= 0 || sourceChannels > convert.MaxChannels {
+		return nil, fmt.Errorf("audio: source channel count must be in the range [1, %d] but was %d", convert.MaxChannels, sourceChannels)
+	}
+	_, seekable := src.(io.Seeker)
+	pi, err := c.playerFactory.newPlayer(c, src, seekable, src, bitDepthInBytesFloat32, sourceChannels)
 	if err != nil {
 		return nil, err
 	}

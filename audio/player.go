@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hajimehoshi/ebiten/v2/audio/internal/convert"
 	"github.com/hajimehoshi/ebiten/v2/internal/mathutil"
 )
 
@@ -76,7 +77,22 @@ type playerImpl struct {
 	stream         *timeStream
 	factory        *playerFactory
 	initBufferSize int
+	// bytesPerSample is the size in bytes of one output frame (two float32 channels).
 	bytesPerSample int
+	// bitDepthInBytesRaw is the bit depth in bytes per sample per channel of the source
+	// before channel mixing.
+	bitDepthInBytesRaw int
+	// sourceChannels is the number of interleaved channels of the source. It is zero until a
+	// channel mix matrix fixes it; then every matrix applied to the player must agree.
+	sourceChannels int
+
+	// playerMixState is this player's own mixing state, or nil for the identity player
+	// matrix. The context's master state is held separately on the Context. The states are
+	// immutable values replaced atomically, and the channel mixer observes the replacements.
+	playerMixState atomic.Pointer[convert.MixState]
+	// mixer is the channel mixer inserted between the source and the time stream, or nil
+	// while the player stays on the legacy passthrough path.
+	mixer *convert.ChannelMixer
 
 	// volume is the player's volume in the range of [0, math.MaxFloat32].
 	// The value is kept here so that a volume set before the underlying player is created is preserved.
@@ -103,20 +119,23 @@ type playerImpl struct {
 	m sync.Mutex
 }
 
-func (f *playerFactory) newPlayer(context *Context, src io.Reader, seekable bool, srcIdent any, bitDepthInBytes int) (*playerImpl, error) {
+func (f *playerFactory) newPlayer(context *Context, src io.Reader, seekable bool, srcIdent any, bitDepthInBytes, sourceChannels int) (*playerImpl, error) {
 	f.m.Lock()
 	defer f.m.Unlock()
 
 	p := &playerImpl{
-		src:            src,
-		seekable:       seekable,
-		srcIdent:       srcIdent,
-		context:        context,
-		factory:        f,
-		lastSamples:    -1,
-		bytesPerSample: bitDepthInBytes * channelCount,
-		volume:         1,
+		src:                src,
+		seekable:           seekable,
+		srcIdent:           srcIdent,
+		context:            context,
+		factory:            f,
+		lastSamples:        -1,
+		bytesPerSample:     bitDepthInBytesFloat32 * channelCount,
+		bitDepthInBytesRaw: bitDepthInBytes,
+		sourceChannels:     sourceChannels,
+		volume:             1,
 	}
+	context.addPlayer(p)
 	// AddCleanup is not set for p. The caller of newPlayer should set a finalizer for p's wrapper.
 	return p, nil
 }
@@ -192,7 +211,25 @@ func (p *playerImpl) ensureStream() error {
 	if p.stream != nil {
 		return nil
 	}
-	s, err := newTimeStream(p.src, p.seekable, p.factory.sampleRate, p.bytesPerSample/channelCount)
+
+	var reader io.Reader = p.src
+	playerState := p.playerMixState.Load()
+	masterState := p.context.loadMasterMixState()
+	if p.sourceChannels == 0 {
+		p.sourceChannels = channelCount
+	}
+
+	// A stereo stream with no player matrix stays on the legacy path while the master state
+	// is the default, so an unconfigured player produces byte-identical output to the old
+	// behavior. Any non-default configuration inserts a channel mixer between the source and
+	// the time stream.
+	if playerState != nil || !masterState.IsDefault() {
+		mixer := convert.NewChannelMixer(reader, p.sourceChannels, p.bitDepthInBytesRaw, &p.playerMixState, &p.context.masterMixState)
+		reader = mixer
+		p.mixer = mixer
+	}
+
+	s, err := newTimeStream(reader, p.seekable, p.factory.sampleRate, bitDepthInBytesFloat32)
 	if err != nil {
 		return err
 	}
@@ -424,6 +461,7 @@ func (p *playerImpl) Close() error {
 	p.pendingPlay = false
 
 	p.context.removePlayingPlayer(p)
+	p.context.removePlayer(p)
 
 	if p.player != nil {
 		defer func() {
@@ -672,6 +710,22 @@ func (s *timeStream) Read(buf []byte) (int, error) {
 	n, err := s.r.Read(buf)
 	s.pos.Add(int64(n))
 	return n, err
+}
+
+// reader returns the stream the device player reads from. The returned reader must not be
+// used concurrently with Read without the caller holding the stream's mutex.
+func (s *timeStream) reader() io.Reader {
+	return s.r
+}
+
+// setReader replaces the stream the device player reads from. It is used to insert a channel
+// mixer between the original source and this stream before the source has been read.
+// setReader takes the same mutex as Read and Seek, so a replacement never races an in-flight
+// read.
+func (s *timeStream) setReader(r io.Reader) {
+	s.m.Lock()
+	defer s.m.Unlock()
+	s.r = r
 }
 
 func (s *timeStream) Seek(offset int64, whence int) (int64, error) {

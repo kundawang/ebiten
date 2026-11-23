@@ -310,8 +310,9 @@ func EnsurePlayerForTesting(p *Player) error {
 func NewPlayerF32WithUnreadyContextForTesting(src io.ReadSeeker, sampleRate int) (*Player, error) {
 	factory := newPlayerFactory(sampleRate)
 	factory.driver = &dummyDriver{}
-	context := &Context{playerFactory: factory}
-	p, err := factory.newPlayer(context, src, true, nil, bitDepthInBytesFloat32)
+	context := &Context{playerFactory: factory, allPlayers: map[*playerImpl]struct{}{}}
+	context.storeMasterMixState(defaultMasterMixState())
+	p, err := factory.newPlayer(context, src, true, nil, bitDepthInBytesFloat32, channelCount)
 	if err != nil {
 		return nil, err
 	}
@@ -393,4 +394,42 @@ func (i *InfiniteLoop) SetNoBlendForTesting(value bool) {
 // integer stereo.
 func NewTimeStreamForTesting(src io.ReadSeeker, sampleRate int) (io.ReadSeeker, error) {
 	return newTimeStream(src, true, sampleRate, bitDepthInBytesInt16)
+}
+
+// PlayerReaderForTesting returns the reader the underlying device player consumes for p,
+// which is the player's time stream (with any channel mixer inserted in front of it).
+// The device must have been created first (see EnsurePlayerForTesting).
+func PlayerReaderForTesting(p *Player) io.Reader {
+	p.p.m.Lock()
+	defer p.p.m.Unlock()
+	if p.p.player == nil {
+		return nil
+	}
+	return p.p.stream
+}
+
+// PlayerSourceChannelsForTesting returns the number of source channels configured for p,
+// or zero when none has been fixed yet.
+func PlayerSourceChannelsForTesting(p *Player) int {
+	p.p.m.Lock()
+	defer p.p.m.Unlock()
+	return p.p.sourceChannels
+}
+
+// PlayerHasMixerForTesting reports whether a channel mixer has been inserted into p's
+// pipeline.
+func PlayerHasMixerForTesting(p *Player) bool {
+	p.p.m.Lock()
+	defer p.p.m.Unlock()
+	return p.p.mixer != nil
+}
+
+// AllPlayersCountForTesting returns the number of players the context tracks, including
+// players that are not playing.
+func AllPlayersCountForTesting() int {
+	c := CurrentContext()
+	c.m.Lock()
+	n := len(c.allPlayers)
+	c.m.Unlock()
+	return n
 }
