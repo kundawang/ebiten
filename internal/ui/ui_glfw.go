@@ -1570,6 +1570,7 @@ func (u *glfwBackend) updateGame() error {
 	// are driven by different GPUs. Measure it again on the new monitor.
 	if r.monitorChanged {
 		u.context.resetVsyncDetection()
+		u.context.framePacing.NotifyRefreshRate(float64(u.RefreshRate()))
 	}
 
 	if err := u.context.updateFrame(u.graphicsDriver, r.outsideWidth, r.outsideHeight, r.screenWidth, r.screenHeight, r.deviceScaleFactor, u.UserInterface, r.present); err != nil {
@@ -1585,8 +1586,8 @@ func (u *glfwBackend) updateGame() error {
 	// When a window is not focused or in another space, SwapBuffers might return immediately even with vsync enabled,
 	// and CPU might be busy. Mitigate this by sleeping for one refresh interval (#982, #2521). With vsync disabled,
 	// swapping buffers is not expected to wait, so do not sleep (#3920). A frame that is not presented is paced by
-	// updateFrame instead.
-	if r.unfocused && r.present && u.FPSMode() == FPSModeVsyncOn {
+	// updateFrame instead, and so is a frame paced by an enabled frame pacing controller.
+	if r.unfocused && r.present && u.FPSMode() == FPSModeVsyncOn && !u.context.framePacing.Enabled() {
 		// Assume 60 [Hz] when the refresh rate is unknown.
 		wait := time.Second / 60
 		if refreshRate := u.RefreshRate(); refreshRate > 0 {

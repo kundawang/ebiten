@@ -290,6 +290,15 @@ func (u *UserInterface) RefreshRate() int {
 	return int(u.refreshRate.Load())
 }
 
+// FramePacing returns the frame pacing controller of the current UI context, or nil when the
+// game is not running. The controller is safe for concurrent use.
+func (u *UserInterface) FramePacing() *FramePacingController {
+	if u.context == nil {
+		return nil
+	}
+	return u.context.framePacing
+}
+
 // IsRunning reports whether the game is running, which is when the graphics driver exists.
 func (u *UserInterface) IsRunning() bool {
 	return u.isRunning()

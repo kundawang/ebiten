@@ -103,12 +103,29 @@ type context struct {
 
 	// presentationSkipped keeps a redraw pending until an ordinary frame can be presented.
 	presentationSkipped bool
+
+	// framePacing is the presentation clock of the context, separate from the update clock in
+	// internal/clock: the update clock decides how many ticks a frame runs, while framePacing
+	// decides when a frame is presented. It is disabled by default, and flushCommandsAndWait
+	// then paces frames as it always has.
+	framePacing *FramePacingController
+
+	// pacingEpoch is the origin of the time base for framePacing.
+	pacingEpoch time.Time
+
+	// pacingNowFunc, when non-nil, replaces the time source for framePacing. For testing.
+	pacingNowFunc func() float64
+
+	// suspended reports whether the GPU resources are saved while the app is suspended.
+	suspended bool
 }
 
 func newContext(game Game, screenTransparent bool) *context {
 	return &context{
 		game:              game,
 		screenTransparent: screenTransparent,
+		framePacing:       NewFramePacingController(FramePacingOptions{}),
+		pacingEpoch:       time.Now(),
 	}
 }
 
@@ -178,7 +195,14 @@ func (c *context) updateFrameImpl(graphicsDriver graphicsdriver.Graphics, update
 	// On Android, GPU resources might be saved until the app is resumed.
 	// Skip updating and drawing until then.
 	if atlas.IsSuspended() {
+		c.suspended = true
 		return true, nil
+	}
+	if c.suspended {
+		c.suspended = false
+		// The GPU resources were recreated while the app was suspended. The presentation
+		// schedule measured against the old device no longer applies.
+		c.framePacing.NotifyDeviceRecreated()
 	}
 
 	debug.FrameLogf("----\n")
@@ -284,6 +308,19 @@ func (c *context) flushCommandsAndWait(needsSwapBuffers, present bool, graphicsD
 
 	now := time.Now()
 
+	// An enabled frame pacing controller is the presentation clock: it decides how long to wait
+	// until the next frame, separately from the update clock, and the loop sleeps for that long.
+	// The controller itself never blocks. A disabled controller, the default, leaves the pacing
+	// below unchanged.
+	if c.framePacing != nil && c.framePacing.Enabled() {
+		d := c.framePacing.PlanFrame(c.pacingNow())
+		if d.Wait > 0 {
+			time.Sleep(d.Wait)
+		}
+		c.lastSwapBufferTime = time.Now()
+		return nil
+	}
+
 	// A frame that is not swapped with vsync enabled tells nothing about whether swapping buffers
 	// waits for the display, and breaks the run of the frames that returned early.
 	if !needsSwapBuffers || !shown || !vsyncEnabled {
@@ -340,6 +377,14 @@ func (c *context) flushCommandsAndWait(needsSwapBuffers, present bool, graphicsD
 	c.lastSwapBufferTime = now
 
 	return nil
+}
+
+// pacingNow returns the current time in the frame pacing controller's time base.
+func (c *context) pacingNow() float64 {
+	if c.pacingNowFunc != nil {
+		return c.pacingNowFunc()
+	}
+	return time.Since(c.pacingEpoch).Seconds()
 }
 
 // resetVsyncDetection makes whether swapping buffers waits for the display measured again.
