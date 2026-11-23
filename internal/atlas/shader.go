@@ -93,6 +93,11 @@ func NewShader(ir *shaderir.Program, name string) *Shader {
 	}
 }
 
+// Reflection returns a reflection snapshot of the shader's program.
+func (s *Shader) Reflection() (*shaderir.Reflection, error) {
+	return s.ir.Reflection()
+}
+
 // shaderCleanupArg is an argument for a Shader's cleanup function.
 type shaderCleanupArg struct {
 	internalShader *graphicscommand.Shader

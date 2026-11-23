@@ -50,6 +50,11 @@ func (s *Shader) Deallocate() {
 	s.shader.Deallocate()
 }
 
+// Reflection returns a reflection snapshot of the shader's program.
+func (s *Shader) Reflection() (*shaderir.Reflection, error) {
+	return s.shader.Reflection()
+}
+
 func (s *Shader) AppendUniforms(dst []uint32, uniforms map[string]any) []uint32 {
 	origLen := len(dst)
 	if cap(dst)-len(dst) >= s.uniformDwordCount {

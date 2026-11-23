@@ -28,6 +28,12 @@ func BuiltinShader(filter builtinshader.Filter, address builtinshader.Address, u
 	return builtinShader(filter, address, useColorM)
 }
 
+// AppendUniformsForTesting exposes Shader.appendUniforms so that tests can compare the encoded
+// uniform block against a ShaderReflectionPlan.
+func (s *Shader) AppendUniformsForTesting(dst []uint32, uniforms map[string]any) []uint32 {
+	return s.appendUniforms(dst, uniforms)
+}
+
 func ResetStencilBufferImagesForTesting() {
 	stencilBufferM.Lock()
 	defer stencilBufferM.Unlock()
