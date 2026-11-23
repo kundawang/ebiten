@@ -453,24 +453,5 @@ func Measure(text string, face Face, lineSpacingInPixels float64) (width, height
 //
 // CacheGlyphs is concurrent-safe.
 func CacheGlyphs(text string, face Face) {
-	var x, y float64
-
-	c := glyphVariationCount(face)
-
-	var buf []LazyGlyph
-	// Create all the possible variations (#2528).
-	for range c {
-		buf = appendLazyGlyphs(buf, text, face, x, y, nil, nil)
-		// Realize each glyph to populate the underlying image cache.
-		for _, g := range buf {
-			g.Image()
-		}
-		buf = buf[:0]
-
-		if face.direction().isHorizontal() {
-			x += 1.0 / float64(c)
-		} else {
-			y += 1.0 / float64(c)
-		}
-	}
+	warmFaceTextVariations(face, text, glyphVariationCount(face))
 }

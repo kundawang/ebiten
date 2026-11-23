@@ -74,6 +74,20 @@ func HasGlyphImageCache(source *GoTextFaceSource, size float64) bool {
 	return ok
 }
 
+// GlyphImageCacheEntryCount returns the number of cached glyph images for the given size.
+func GlyphImageCacheEntryCount(source *GoTextFaceSource, size float64) int {
+	c := &source.glyphImageCache
+	c.mu.Lock()
+	e, ok := c.caches[size]
+	c.mu.Unlock()
+	if !ok {
+		return 0
+	}
+	e.cache.m.Lock()
+	defer e.cache.m.Unlock()
+	return len(e.cache.values)
+}
+
 // TouchGlyphImageCache creates or refreshes the glyph image cache for the size of the given face,
 // as if the face were used at the given tick.
 func TouchGlyphImageCache(face *GoTextFace, now int64) {
