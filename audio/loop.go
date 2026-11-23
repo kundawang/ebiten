@@ -15,6 +15,7 @@
 package audio
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -42,10 +43,89 @@ type InfiniteLoop struct {
 	// partialAfterLoop is the part of afterLoop read before a source error. The source position is right after it.
 	partialAfterLoop []byte
 
-	// blending represents whether the loop start and afterLoop are blended or not.
+	// blending represents whether the legacy blending of the loop start and afterLoop is active.
 	blending bool
 
+	// legacyBlend reports whether this loop was created by one of the NewInfiniteLoop* functions.
+	// Such a loop blends the loop start with all the data after the loop end it reads (at most 256 frames).
+	legacyBlend bool
+
+	// fadeFrames is the number of frames of the configured crossfade. It is used when legacyBlend is false.
+	fadeFrames int64
+
+	// curve computes the crossfade gains. It is only used when legacyBlend is false.
+	curve LoopCrossfadeCurve
+
+	// tailCaptured reports that the configured crossfade has already tried to read the data after the
+	// loop end. It keeps a source with no tail from being read again at every loop end.
+	tailCaptured bool
+
 	noBlendForTesting bool
+}
+
+// LoopCrossfadeCurve returns the gains applied to the loop-start data and to the data after the loop end
+// when they are crossfaded.
+//
+// t is the normalized position in the crossfade window: 0 is the beginning of the loop and 1 is the end
+// of the window. The first return value is the gain of the loop-start data and the second is the gain of
+// the data after the loop end. A gain is clamped to [0, 1], and non-finite gains are handled as a
+// bounded degradation: they are replaced by the linear gains at the same position.
+//
+// LoopCrossfadeLinear and LoopCrossfadeEqualPower are typical curves.
+type LoopCrossfadeCurve func(t float64) (loopStartGain, afterLoopGain float64)
+
+// LoopCrossfadeLinear is a linear crossfade curve.
+//
+// The gains of the loop-start data and the data after the loop end sum to 1.
+func LoopCrossfadeLinear(t float64) (loopStartGain, afterLoopGain float64) {
+	return t, 1 - t
+}
+
+// LoopCrossfadeEqualPower is an equal-power crossfade curve.
+//
+// The squared gains of the loop-start data and the data after the loop end sum to 1, so that the
+// perceived loudness stays constant during the crossfade.
+func LoopCrossfadeEqualPower(t float64) (loopStartGain, afterLoopGain float64) {
+	return math.Sincos(t * math.Pi / 2)
+}
+
+// LoopCrossfadePlan describes a crossfade at a loop joint.
+//
+// A crossfade mixes the first FadeFrames frames of every loop repetition with the source data that
+// follows the loop end (the tail). At the loop start the output is the tail, and the output ramps to
+// the loop data as the window advances. The tail is read once when the loop end is first reached and is
+// reused for every repetition, so a crossfade does not read the source again per repetition.
+//
+// The crossfade does not change the loop's length or its positions: Length and Seek behave exactly as
+// they do without a crossfade. A failed Seek leaves the crossfade state unchanged. The tail is
+// captured when the loop end is first reached, so data read before that first pass cannot be
+// crossfaded. After the capture, the crossfade is a function of the position alone: a read inside the
+// window, including one right after a Seek, gets the same output for the same source data.
+//
+// If the source ends in the middle of the tail, the trailing partial frame is dropped and the window
+// is shortened to the whole frames that were read. If the source has no data after the loop end, the
+// loop is not crossfaded.
+//
+// IntroLength and LoopLength are in bytes, like the arguments of NewInfiniteLoopWithIntro, and are
+// rounded down to whole frames. One frame is one sample per channel: 4 bytes in the 16-bit integer
+// format and 8 bytes in the 32-bit float format.
+type LoopCrossfadePlan struct {
+	// IntroLength is the length of the intro in bytes. It is rounded down to a whole frame and must be
+	// non-negative.
+	IntroLength int64
+
+	// LoopLength is the length of the loop in bytes. It is rounded down to a whole frame and must be
+	// at least one frame.
+	LoopLength int64
+
+	// FadeFrames is the length of the crossfade in frames. Zero disables the crossfade, leaving the
+	// loop data untouched. A negative value is an error. A value longer than the loop is shortened to
+	// the loop length, since a longer window would never end before the loop repeats. The window is
+	// also capped to 8 MiB of buffered source data.
+	FadeFrames int64
+
+	// Curve computes the crossfade gains. If Curve is nil, LoopCrossfadeLinear is used.
+	Curve LoopCrossfadeCurve
 }
 
 // NewInfiniteLoop creates a new infinite loop stream with a source stream and length in bytes.
@@ -116,11 +196,88 @@ func newInfiniteLoopWithIntro(src io.ReadSeeker, introLength int64, loopLength i
 		pos:             -1,
 		bitDepthInBytes: bitDepthInBytes,
 		bytesPerSample:  bytesPerSample,
+		legacyBlend:     true,
 	}
+}
+
+// NewInfiniteLoopWithCrossfade creates a new infinite loop stream with a source stream and a crossfade plan.
+//
+// src is a signed 16bit integer little endian stream, 2 channels (stereo).
+//
+// The plan defines the intro and loop regions and the crossfade at the loop joint. Unlike the
+// NewInfiniteLoop* functions, this function does not panic on an invalid plan: it returns an error
+// describing the invalid field. See LoopCrossfadePlan for the crossfade semantics.
+func NewInfiniteLoopWithCrossfade(src io.ReadSeeker, plan LoopCrossfadePlan) (*InfiniteLoop, error) {
+	return newInfiniteLoopWithCrossfade(src, plan, bitDepthInBytesInt16)
+}
+
+// NewInfiniteLoopWithCrossfadeF32 creates a new infinite loop stream with a source stream and a crossfade plan.
+//
+// src is a 32bit float little endian stream, 2 channels (stereo).
+//
+// The plan defines the intro and loop regions and the crossfade at the loop joint. Unlike the
+// NewInfiniteLoop* functions, this function does not panic on an invalid plan: it returns an error
+// describing the invalid field. See LoopCrossfadePlan for the crossfade semantics.
+func NewInfiniteLoopWithCrossfadeF32(src io.ReadSeeker, plan LoopCrossfadePlan) (*InfiniteLoop, error) {
+	return newInfiniteLoopWithCrossfade(src, plan, bitDepthInBytesFloat32)
+}
+
+// maxLoopCrossfadeBytes bounds the tail data a crossfade buffers. A longer crossfade is shortened to
+// this many bytes (and to the loop length) so that a very long fade does not allocate unbounded memory.
+const maxLoopCrossfadeBytes = 8 << 20
+
+func newInfiniteLoopWithCrossfade(src io.ReadSeeker, plan LoopCrossfadePlan, bitDepthInBytes int) (*InfiniteLoop, error) {
+	bytesPerSample := bitDepthInBytes * channelCount
+	if plan.IntroLength < 0 {
+		return nil, fmt.Errorf("audio: crossfade intro length must be >= 0 but was %d", plan.IntroLength)
+	}
+	if plan.LoopLength <= 0 {
+		return nil, fmt.Errorf("audio: crossfade loop length must be positive but was %d", plan.LoopLength)
+	}
+	if plan.FadeFrames < 0 {
+		return nil, fmt.Errorf("audio: crossfade frame count must be >= 0 but was %d", plan.FadeFrames)
+	}
+
+	lstart := plan.IntroLength / int64(bytesPerSample) * int64(bytesPerSample)
+	llength := plan.LoopLength / int64(bytesPerSample) * int64(bytesPerSample)
+	if llength <= 0 {
+		return nil, fmt.Errorf("audio: crossfade loop length must be at least one frame (%d bytes) but was %d", bytesPerSample, plan.LoopLength)
+	}
+	if lstart > math.MaxInt64-llength {
+		return nil, fmt.Errorf("audio: crossfade intro length %d and loop length %d overflow the stream length", plan.IntroLength, plan.LoopLength)
+	}
+
+	// A window longer than the loop would never end before the loop repeats, and an unbounded one
+	// could allocate an arbitrarily large buffer. Shorten it rather than failing, so that a slightly
+	// too long fade is still usable.
+	fadeFrames := min(plan.FadeFrames, llength/int64(bytesPerSample), maxLoopCrossfadeBytes/int64(bytesPerSample))
+	curve := plan.Curve
+	if curve == nil {
+		curve = LoopCrossfadeLinear
+	}
+
+	return &InfiniteLoop{
+		src:             src,
+		lstart:          lstart,
+		llength:         llength,
+		pos:             -1,
+		bitDepthInBytes: bitDepthInBytes,
+		bytesPerSample:  bytesPerSample,
+		fadeFrames:      fadeFrames,
+		curve:           curve,
+	}, nil
 }
 
 func (i *InfiniteLoop) length() int64 {
 	return i.lstart + i.llength
+}
+
+// Length returns the length in bytes of one pass through the loop, that is the intro length plus the
+// loop length.
+//
+// A crossfade does not change Length: it only shapes the samples around the loop joint.
+func (i *InfiniteLoop) Length() int64 {
+	return i.length()
 }
 
 func (i *InfiniteLoop) ensurePos() error {
@@ -151,6 +308,172 @@ func (i *InfiniteLoop) blendRate(pos int64) float32 {
 		return 0
 	}
 	return 1 - float32(p)/float32(l)
+}
+
+// afterLoopBytes returns the number of bytes after the loop end to buffer for the crossfade.
+//
+// It returns 0 when there is nothing to buffer: either the loop uses the legacy blending, whose
+// amount is fixed, or the crossfade is disabled.
+func (i *InfiniteLoop) afterLoopBytes() int64 {
+	if i.legacyBlend {
+		return min(int64(256*i.bytesPerSample), i.length())
+	}
+	if i.fadeFrames <= 0 {
+		return 0
+	}
+	return i.fadeFrames * int64(i.bytesPerSample)
+}
+
+// captureAfterLoop reads the data after the loop end once, so that later repetitions can crossfade
+// with it. It does nothing when the data was already captured or when the loop needs none.
+//
+// The read is bounded by the planned crossfade length and breaks on a source that makes no progress,
+// so a faulty or endless source cannot spin here.
+func (i *InfiniteLoop) captureAfterLoop() error {
+	buflen := i.afterLoopBytes()
+	if buflen <= 0 {
+		return nil
+	}
+	// The configured crossfade reads the source once at the first loop end. If the source has no
+	// tail then, there is nothing to crossfade with, and reading it again at every loop end would
+	// repeat the same failing or empty read forever.
+	if !i.legacyBlend && i.tailCaptured {
+		return nil
+	}
+	if len(i.afterLoop) == 0 {
+		buf := make([]byte, buflen)
+		pos := copy(buf, i.partialAfterLoop)
+		i.partialAfterLoop = nil
+		for pos < len(buf) {
+			nn, err := i.src.Read(buf[pos:])
+			pos += nn
+			if err != nil && err != io.EOF {
+				i.partialAfterLoop = buf[:pos]
+				return fmt.Errorf("audio: reading the data after the loop: %w", err)
+			}
+			// Break on EOF, and also when no progress is made so that a source returning
+			// (0, nil) does not spin here forever.
+			if err != nil || nn == 0 {
+				break
+			}
+		}
+
+		// A configured crossfade needs whole frames. A trailing partial frame is dropped, which is a
+		// bounded degradation when the source ends in the middle of a frame.
+		if !i.legacyBlend {
+			pos -= pos % i.bytesPerSample
+		}
+		i.afterLoop = buf[:pos]
+	}
+	if !i.legacyBlend {
+		i.tailCaptured = true
+		// A configured crossfade is a function of the position and the captured tail, so it needs no
+		// separate on/off state: a successful Seek keeps it, and a failed one leaves everything as is.
+		return nil
+	}
+	// The legacy blending is turned on once the data after the loop end is available. A successful
+	// Seek clears it, and the next loop end turns it back on without reading the source again.
+	if len(i.afterLoop) > 0 {
+		i.blending = true
+	}
+	return nil
+}
+
+// crossfadeGains returns the gains applied to the loop data and to the data after the loop end for
+// the given frame in the crossfade window. frame must be within the effective window.
+func (i *InfiniteLoop) crossfadeGains(frame int64) (loopGain, afterLoopGain float64) {
+	frames := i.fadeFrames
+	// A short source shortens the window rather than leaving the tail silent, so that the gains still
+	// reach the loop data.
+	if tailFrames := int64(len(i.afterLoop)) / int64(i.bytesPerSample); tailFrames < frames {
+		frames = tailFrames
+	}
+	if frames <= 0 || frame < 0 || frame >= frames {
+		return 1, 0
+	}
+	t := float64(frame) / float64(frames)
+	loopGain, afterLoopGain = i.curve(t)
+	// A curve that produces a non-finite gain is a bounded degradation: use the linear curve there.
+	if !isFinite(loopGain) || !isFinite(afterLoopGain) {
+		loopGain, afterLoopGain = LoopCrossfadeLinear(t)
+	}
+	return clamp01(loopGain), clamp01(afterLoopGain)
+}
+
+func isFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+func clamp01(v float64) float64 {
+	return min(max(v, 0), 1)
+}
+
+// crossfade applies the configured crossfade to b, whose first byte is at stream position bpos.
+//
+// The crossfade works per channel value, so that a stream whose first read starts in the middle of a
+// frame is still mixed consistently: the gain of a channel value is taken from the frame containing
+// it, and the value is mixed with the tail bytes at the same offset from the loop end. Channel values
+// that straddle two source values, which can only happen when src is positioned inside a frame before
+// the loop is created, are left raw.
+func (i *InfiniteLoop) crossfade(b []byte, bpos int64) {
+	if i.noBlendForTesting || i.fadeFrames <= 0 || len(i.afterLoop) == 0 {
+		return
+	}
+	if bpos+int64(len(b)) <= i.lstart || bpos >= i.lstart+int64(len(i.afterLoop)) {
+		return
+	}
+	if len(b)%i.bitDepthInBytes != 0 {
+		panic(fmt.Sprintf("audio: len(b) (%d) must be a multiple of bit depth %d [bytes]", len(b), i.bitDepthInBytes))
+	}
+
+	bitsPerChannel := i.bitDepthInBytes * 8
+	var (
+		lastFrame     int64 = -1
+		loopGain      float64
+		afterLoopGain float64
+	)
+	for idx := range len(b) / i.bitDepthInBytes {
+		abspos := bpos + int64(idx)*int64(i.bitDepthInBytes)
+		rel := abspos - i.lstart
+		if rel < 0 {
+			continue
+		}
+		// A value not aligned with the loop start would straddle two source values, so it cannot be
+		// mixed with one whole value from the tail.
+		if rel%int64(i.bitDepthInBytes) != 0 {
+			continue
+		}
+		// Stop once the tail ends. A source that ends in the middle of a frame drops the trailing
+		// partial value, so the last whole value starts strictly before the end.
+		if rel+int64(i.bitDepthInBytes) > int64(len(i.afterLoop)) {
+			break
+		}
+
+		frame := rel / int64(i.bytesPerSample)
+		if frame != lastFrame {
+			lastFrame = frame
+			loopGain, afterLoopGain = i.crossfadeGains(frame)
+		}
+		if afterLoopGain == 0 {
+			continue
+		}
+
+		off := idx * i.bitDepthInBytes
+		switch bitsPerChannel {
+		case 16:
+			orig := int16(binary.LittleEndian.Uint16(b[off:]))
+			afterLoop := int16(binary.LittleEndian.Uint16(i.afterLoop[rel:]))
+			newVal := int16(float64(afterLoop)*afterLoopGain + float64(orig)*loopGain)
+			binary.LittleEndian.PutUint16(b[off:], uint16(newVal))
+		case 32:
+			orig := math.Float32frombits(binary.LittleEndian.Uint32(b[off:]))
+			afterLoop := math.Float32frombits(binary.LittleEndian.Uint32(i.afterLoop[rel:]))
+			newVal := float32(float64(afterLoop)*afterLoopGain + float64(orig)*loopGain)
+			binary.LittleEndian.PutUint32(b[off:], math.Float32bits(newVal))
+		default:
+			panic("not reached")
+		}
+	}
 }
 
 // Read is an implementation of ReadSeeker's Read.
@@ -221,6 +544,14 @@ func (i *InfiniteLoop) readShortBuffer() error {
 			if i.pos == i.lstart || rewinds > 0 {
 				return io.EOF
 			}
+			// Capture the data after the loop even when only short reads passed the loop end, so
+			// that a configured crossfade does not depend on the destination buffer size. The
+			// legacy blending keeps its historical timing and captures only on a full read.
+			if !i.legacyBlend && i.pos == i.length() {
+				if err := i.captureAfterLoop(); err != nil {
+					return err
+				}
+			}
 			if err := i.rewind(); err != nil {
 				return err
 			}
@@ -274,37 +605,15 @@ func (i *InfiniteLoop) read(b []byte) (int, error) {
 
 	// Blend afterLoop and the loop start to reduce noises (#1888).
 	// Ideally, afterLoop and the loop start should be identical, but they can have very slight differences.
-	if !i.noBlendForTesting && i.blending && i.pos >= i.lstart && bpos < i.lstart+int64(len(i.afterLoop)) {
-		if n%i.bitDepthInBytes != 0 {
-			panic(fmt.Sprintf("audio: n (%d) must be a multiple of bit depth %d [bytes]", n, i.bitDepthInBytes))
-		}
-		for idx := range n / i.bitDepthInBytes {
-			abspos := bpos + int64(idx)*int64(i.bitDepthInBytes)
-			rate := i.blendRate(abspos)
-			if rate == 0 {
-				continue
+	if !i.noBlendForTesting {
+		if i.legacyBlend {
+			if i.blending {
+				i.blendAfterLoopLegacy(b[:n], bpos)
 			}
-
-			relpos := abspos - i.lstart
-			switch i.bitDepthInBytes {
-			case 2:
-				afterLoop := int16(i.afterLoop[relpos]) | (int16(i.afterLoop[relpos+1]) << 8)
-				orig := int16(b[2*idx]) | (int16(b[2*idx+1]) << 8)
-				newVal := int16(float32(afterLoop)*rate + float32(orig)*(1-rate))
-				b[2*idx] = byte(newVal)
-				b[2*idx+1] = byte(newVal >> 8)
-			case 4:
-				afterLoop := math.Float32frombits(uint32(i.afterLoop[relpos]) | (uint32(i.afterLoop[relpos+1]) << 8) | (uint32(i.afterLoop[relpos+2]) << 16) | (uint32(i.afterLoop[relpos+3]) << 24))
-				orig := math.Float32frombits(uint32(b[4*idx]) | (uint32(b[4*idx+1]) << 8) | (uint32(b[4*idx+2]) << 16) | (uint32(b[4*idx+3]) << 24))
-				newVal := float32(afterLoop*rate + orig*(1-rate))
-				newValBits := math.Float32bits(newVal)
-				b[4*idx] = byte(newValBits)
-				b[4*idx+1] = byte(newValBits >> 8)
-				b[4*idx+2] = byte(newValBits >> 16)
-				b[4*idx+3] = byte(newValBits >> 24)
-			default:
-				panic("not reached")
-			}
+		} else {
+			// A configured crossfade is a function of the position and the captured tail, so it does
+			// not depend on whether the loop was just rewound or sought.
+			i.crossfade(b[:n], bpos)
 		}
 	}
 
@@ -314,34 +623,51 @@ func (i *InfiniteLoop) read(b []byte) (int, error) {
 
 	// Read the afterLoop part if necessary.
 	if i.pos == i.length() && err == nil {
-		if len(i.afterLoop) == 0 {
-			buflen := min(int64(256*i.bytesPerSample), i.length())
-
-			buf := make([]byte, buflen)
-			pos := copy(buf, i.partialAfterLoop)
-			i.partialAfterLoop = nil
-			for pos < len(buf) {
-				nn, err := i.src.Read(buf[pos:])
-				pos += nn
-				if err != nil && err != io.EOF {
-					i.partialAfterLoop = buf[:pos]
-					return n, err
-				}
-				// Break on EOF, and also when no progress is made so that a
-				// source returning (0, nil) does not spin here forever. The
-				// main read loop above has the same guard.
-				if err != nil || nn == 0 {
-					break
-				}
-			}
-			i.afterLoop = buf[:pos]
-		}
-		if len(i.afterLoop) > 0 {
-			i.blending = true
+		if err := i.captureAfterLoop(); err != nil {
+			return n, err
 		}
 	}
 
 	return n, err
+}
+
+// blendAfterLoopLegacy blends the loop data in b with the data after the loop end the way the
+// NewInfiniteLoop* constructors have always done: a linear ramp whose length is the whole tail.
+func (i *InfiniteLoop) blendAfterLoopLegacy(b []byte, bpos int64) {
+	if i.pos < i.lstart || bpos >= i.lstart+int64(len(i.afterLoop)) {
+		return
+	}
+	if len(b)%i.bitDepthInBytes != 0 {
+		panic(fmt.Sprintf("audio: len(b) (%d) must be a multiple of bit depth %d [bytes]", len(b), i.bitDepthInBytes))
+	}
+	for idx := range len(b) / i.bitDepthInBytes {
+		abspos := bpos + int64(idx)*int64(i.bitDepthInBytes)
+		rate := i.blendRate(abspos)
+		if rate == 0 {
+			continue
+		}
+
+		relpos := abspos - i.lstart
+		switch i.bitDepthInBytes {
+		case 2:
+			afterLoop := int16(i.afterLoop[relpos]) | (int16(i.afterLoop[relpos+1]) << 8)
+			orig := int16(b[2*idx]) | (int16(b[2*idx+1]) << 8)
+			newVal := int16(float32(afterLoop)*rate + float32(orig)*(1-rate))
+			b[2*idx] = byte(newVal)
+			b[2*idx+1] = byte(newVal >> 8)
+		case 4:
+			afterLoop := math.Float32frombits(uint32(i.afterLoop[relpos]) | (uint32(i.afterLoop[relpos+1]) << 8) | (uint32(i.afterLoop[relpos+2]) << 16) | (uint32(i.afterLoop[relpos+3]) << 24))
+			orig := math.Float32frombits(uint32(b[4*idx]) | (uint32(b[4*idx+1]) << 8) | (uint32(b[4*idx+2]) << 16) | (uint32(b[4*idx+3]) << 24))
+			newVal := float32(afterLoop*rate + orig*(1-rate))
+			newValBits := math.Float32bits(newVal)
+			b[4*idx] = byte(newValBits)
+			b[4*idx+1] = byte(newValBits >> 8)
+			b[4*idx+2] = byte(newValBits >> 16)
+			b[4*idx+3] = byte(newValBits >> 24)
+		default:
+			panic("not reached")
+		}
+	}
 }
 
 // rewind moves the position back to the loop start.
@@ -403,7 +729,12 @@ func (i *InfiniteLoop) Seek(offset int64, whence int) (int64, error) {
 	if _, err := i.src.Seek(next, io.SeekStart); err != nil {
 		return 0, err
 	}
-	i.blending = false
+	// A configured crossfade is a function of the position and the captured tail, so it stays active
+	// after a seek. The legacy blending is cleared, as it has always been, and turns on again at the
+	// next loop end.
+	if i.legacyBlend {
+		i.blending = false
+	}
 	i.pos = next
 	i.extra = i.extra[:0]
 	i.partialAfterLoop = nil
