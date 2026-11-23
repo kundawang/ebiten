@@ -123,6 +123,57 @@ func (m *svgMemo[K, V]) GetSized(key K, entryLimit, byteLimit, sizeBytes int, cr
 	return m.getSized(key, entryLimit, byteLimit, sizeBytes, create)
 }
 
+// NewImageCacheForTesting creates a standalone budget-aware glyph image cache.
+func NewImageCacheForTesting[K comparable](softLimit int) *imageCache[K] {
+	return newImageCache[K](softLimit)
+}
+
+// ImageCacheLen reports the number of entries in a test image cache.
+func ImageCacheLen[K comparable](c *imageCache[K]) int {
+	return c.len()
+}
+
+// ImageCacheGetOrCreateAt drives a test image cache with an explicit tick.
+func ImageCacheGetOrCreateAt[K comparable](c *imageCache[K], key K, tick int64, create func() (*ebiten.Image, bool)) *ebiten.Image {
+	return c.getOrCreateAt(key, tick, create)
+}
+
+// ImageCacheClear clears a test image cache.
+func ImageCacheClear[K comparable](c *imageCache[K]) {
+	c.clear()
+}
+
+// ImageCacheSetBudget attaches a budget to a test image cache.
+func ImageCacheSetBudget[K comparable](c *imageCache[K], budget *GlyphAtlasBudget, familyID uint64) {
+	c.setBudget(budget, familyID)
+}
+
+// NewGlyphAtlasBudgetForTesting exposes the constructor to external test packages.
+func NewGlyphAtlasBudgetForTesting(options GlyphAtlasBudgetOptions) *GlyphAtlasBudget {
+	return NewGlyphAtlasBudget(options)
+}
+
+// GlyphImageCount returns the total number of glyph images retained by the
+// source across all face-size caches.
+func GlyphImageCount(source *GoTextFaceSource) int {
+	return source.glyphImageCache.glyphCount()
+}
+
+// GlyphImageCacheBudget returns the source's attached budget, or nil.
+func GlyphImageCacheBudget(source *GoTextFaceSource) *GlyphAtlasBudget {
+	return source.glyphImageCache.budget
+}
+
+// GoXFaceGlyphImageCount returns the number of glyph images cached by the face.
+func GoXFaceGlyphImageCount(face *GoXFace) int {
+	return face.glyphImageCache.len()
+}
+
+// GoXFaceCacheBudget returns the face's attached budget, or nil.
+func GoXFaceCacheBudget(face *GoXFace) *GlyphAtlasBudget {
+	return face.glyphImageCache.budget
+}
+
 func GoTextFaceVariationState(face *GoTextFace) ([]font.Variation, string) {
 	return slices.Clone(face.variations.values()), face.variations.key
 }

@@ -287,13 +287,17 @@ type goTextGlyphImageArgs struct {
 	svgKey         svgGlyphKey
 }
 
-// glyphImage implements glyphImager.
-func (im *goTextLineImager) glyphImage(index int) *ebiten.Image {
+// glyphImage implements glyphImager. The returned lease is nil when the
+// cache has no budget, the glyph is an SVG image, or the glyph bypassed the
+// cache as oversized.
+func (im *goTextLineImager) glyphImage(index int) (*ebiten.Image, glyphLease) {
 	args := &im.args[index]
 	glyph := args.glyph
 	rd := glyph.render
 	if args.svg != nil {
-		return im.source.svgFont.image(args.svgKey, args.svg, float64(im.source.f.Upem()))
+		// SVG images live in the svgFont memo, which has its own bounded
+		// LRU and is not covered by the glyph image lease mechanism.
+		return im.source.svgFont.image(args.svgKey, args.svg, float64(im.source.f.Upem())), nil
 	}
 	// A bitmap glyph is pixel-aligned and its subpixel offset is always
 	// zero (see goTextGlyphImageInfo), so one key form covers both the
@@ -305,8 +309,14 @@ func (im *goTextLineImager) glyphImage(index int) *ebiten.Image {
 		variations: im.variations,
 		sideways:   rd.sideways,
 	}
+	cache := im.source.glyphImageCache.cacheForSize(im.size, im.variationCount, ebiten.Tick())
+	// Fast path: take a lease so an attached budget cannot evict the image
+	// while the caller still intends to draw it.
+	if img, lease := cache.acquire(key); img != nil {
+		return img, lease
+	}
 	subpixelOffset := args.subpixelOffset
-	return im.source.getOrCreateGlyphImage(im.size, im.variationCount, key, func() (*ebiten.Image, bool) {
+	img := im.source.getOrCreateGlyphImage(im.size, im.variationCount, key, func() (*ebiten.Image, bool) {
 		if bm := rd.bitmap(); bm != nil {
 			return ebiten.NewImageFromImage(bm), true
 		}
@@ -318,6 +328,21 @@ func (im *goTextLineImager) glyphImage(index int) *ebiten.Image {
 		img := segmentsToImage(rd.segments(), subpixelOffset, rd.bounds)
 		return img, img != nil
 	})
+	// The freshly created image may have bypassed the cache as oversized;
+	// only take a lease when it actually entered.
+	if img2, lease := cache.acquire(key); img2 != nil {
+		return img2, lease
+	}
+	return img, nil
+}
+
+// releaseLease implements glyphImager.
+func (im *goTextLineImager) releaseLease(lease glyphLease) {
+	l, ok := lease.(*lruEntry)
+	if !ok || l == nil {
+		return
+	}
+	l.release()
 }
 
 // glyphColored implements glyphImager.

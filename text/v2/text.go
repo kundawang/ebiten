@@ -298,11 +298,49 @@ type LazyGlyph struct {
 // The returned image is a grayscale image i.e. RGBA values are the same,
 // except for color glyphs like emojis, whose image is colored.
 // The returned image should be used as a render source and must not be modified.
+//
+// When a [GlyphAtlasBudget] is attached, Image protects the returned image
+// from eviction only for the duration of the lookup; the cache may replace
+// it after Image returns. The package's own Draw keeps its glyphs leased for
+// the whole draw pass, so this only affects callers that retain an Image
+// across frames: use [LazyGlyph.AcquireImage] and [LazyGlyph.ReleaseImage]
+// in that case.
 func (g LazyGlyph) Image() *ebiten.Image {
 	if g.imager == nil {
 		return nil
 	}
+	img, lease := g.imager.glyphImage(g.imageIndex)
+	// The caller gets no lease handle, so end it immediately. The image
+	// object stays valid even if the cache later evicts it; the next lookup
+	// regenerates identical pixels.
+	g.imager.releaseLease(lease)
+	return img
+}
+
+// AcquireImage returns the rasterized glyph bitmap together with a lease
+// that keeps it protected from glyph-budget eviction.
+//
+// Use AcquireImage instead of [LazyGlyph.Image] when you retain the image
+// across the call that produced the LazyGlyph, for example in a custom
+// batching renderer. Every non-nil lease must be paired with exactly one
+// [LazyGlyph.ReleaseImage].
+//
+// AcquireImage returns (nil, nil) for control characters and zero-area glyphs.
+func (g LazyGlyph) AcquireImage() (*ebiten.Image, glyphLease) {
+	if g.imager == nil {
+		return nil, nil
+	}
 	return g.imager.glyphImage(g.imageIndex)
+}
+
+// ReleaseImage ends a lease obtained from [LazyGlyph.AcquireImage] or the
+// package's internal draw path. A nil lease is harmless, so it is safe to
+// call unconditionally.
+func (g LazyGlyph) ReleaseImage(lease glyphLease) {
+	if g.imager == nil || lease == nil {
+		return
+	}
+	g.imager.releaseLease(lease)
 }
 
 // Colored reports whether the image returned by [LazyGlyph.Image] is colored
@@ -318,9 +356,22 @@ func (g LazyGlyph) Colored() bool {
 // index within a face-specific args slice, and reports whether the glyph is
 // colored without rasterizing it. Implementations are allocated once per
 // face per call to appendLazyGlyphsForLine.
+//
+// The lease returned by glyphImage protects the image from a glyph-budget
+// eviction until releaseLease is called. It is nil for caches without a
+// budget and for glyph images that bypass the cache.
 type glyphImager interface {
-	glyphImage(index int) *ebiten.Image
+	glyphImage(index int) (img *ebiten.Image, lease glyphLease)
 	glyphColored(index int) bool
+
+	// releaseLease ends a lease previously returned by glyphImage. A nil
+	// lease is a no-op.
+	releaseLease(lease glyphLease)
+}
+
+// glyphLease is an opaque protection handle against glyph budget eviction.
+type glyphLease interface {
+	release()
 }
 
 // Advance returns the advanced distance from the origin position when rendering the given text with the given face.

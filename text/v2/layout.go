@@ -86,6 +86,7 @@ var theDrawGlyphsPool = sync.Pool{
 // which must not be tinted by the text color.
 type drawGlyphEntry struct {
 	img     *ebiten.Image
+	lease   glyphLease
 	x       float64
 	y       float64
 	colored bool
@@ -178,12 +179,16 @@ func Draw(dst *ebiten.Image, text string, face Face, options *DrawOptions) {
 		if !transformedRectOverlaps(geoM, g.ImageBounds, dstBounds) {
 			continue
 		}
-		img := g.Image()
+		// Acquire with a lease so an attached glyph budget cannot evict an
+		// image between realization and the draw call below. Leases are
+		// released once every DrawImage has been issued.
+		img, lease := g.AcquireImage()
 		if img == nil {
 			continue
 		}
 		*entries = append(*entries, drawGlyphEntry{
 			img:     img,
+			lease:   lease,
 			x:       float64(g.ImageBounds.Min.X),
 			y:       float64(g.ImageBounds.Min.Y),
 			colored: g.Colored(),
@@ -205,6 +210,14 @@ func Draw(dst *ebiten.Image, text string, face Face, options *DrawOptions) {
 		op.GeoM.Translate(e.x, e.y)
 		op.GeoM.Concat(geoM)
 		dst.DrawImage(e.img, op)
+	}
+
+	// Now that every draw command has been issued, the images no longer
+	// need protection from budget eviction.
+	for _, e := range *entries {
+		if l, ok := e.lease.(*lruEntry); ok && l != nil {
+			l.release()
+		}
 	}
 }
 

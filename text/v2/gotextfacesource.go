@@ -114,7 +114,7 @@ const glyphImageCachesSoftLimit = 16
 const metricsCacheSoftLimit = 32
 
 type glyphImageCacheEntry struct {
-	cache *cache[goTextGlyphImageCacheKey, *ebiten.Image]
+	cache *imageCache[goTextGlyphImageCacheKey]
 
 	// atime is the last tick when the cache was accessed.
 	atime int64
@@ -126,6 +126,12 @@ type glyphImageCaches struct {
 
 	// atime is the last tick when the caches were cleaned up.
 	atime int64
+
+	// budget is the shared hard-budget policy, or nil.
+	budget *GlyphAtlasBudget
+
+	// familyID identifies the owning source for budget pinning.
+	familyID uint64
 
 	// mu guards caches, not the caches in it: each cache has its own
 	// mutex, and creating a glyph image must not block another size's
@@ -140,7 +146,7 @@ func (c *glyphImageCaches) getOrCreate(size float64, variationCount int, key goT
 // cacheForSize returns the cache for the given size, creating it if necessary.
 // variationCount determines the capacity of a newly created cache.
 // n is the current tick.
-func (c *glyphImageCaches) cacheForSize(size float64, variationCount int, n int64) *cache[goTextGlyphImageCacheKey, *ebiten.Image] {
+func (c *glyphImageCaches) cacheForSize(size float64, variationCount int, n int64) *imageCache[goTextGlyphImageCacheKey] {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -152,8 +158,12 @@ func (c *glyphImageCaches) cacheForSize(size float64, variationCount int, n int6
 	if c.caches == nil {
 		c.caches = map[float64]*glyphImageCacheEntry{}
 	}
+	cache := newImageCache[goTextGlyphImageCacheKey](128 * variationCount)
+	if c.budget != nil {
+		cache.setBudget(c.budget, c.familyID)
+	}
 	e := &glyphImageCacheEntry{
-		cache: newCache[goTextGlyphImageCacheKey, *ebiten.Image](128 * variationCount),
+		cache: cache,
 		atime: n,
 	}
 	c.caches[size] = e
@@ -176,6 +186,46 @@ func (c *glyphImageCaches) cacheForSize(size float64, variationCount int, n int6
 	c.atime = n
 
 	return e.cache
+}
+
+// setBudget attaches or detaches the hard budget on every per-size cache,
+// including caches created later.
+func (c *glyphImageCaches) setBudget(budget *GlyphAtlasBudget, familyID uint64) {
+	c.mu.Lock()
+	c.budget = budget
+	c.familyID = familyID
+	for _, e := range c.caches {
+		e.cache.setBudget(budget, familyID)
+	}
+	c.mu.Unlock()
+}
+
+// clear drops the glyph images of every per-size cache.
+func (c *glyphImageCaches) clear() {
+	c.mu.Lock()
+	caches := make([]*imageCache[goTextGlyphImageCacheKey], 0, len(c.caches))
+	for _, e := range c.caches {
+		caches = append(caches, e.cache)
+	}
+	c.mu.Unlock()
+	for _, cache := range caches {
+		cache.clear()
+	}
+}
+
+// glyphCount aggregates the number of retained glyph images over all sizes.
+func (c *glyphImageCaches) glyphCount() int {
+	c.mu.Lock()
+	caches := make([]*imageCache[goTextGlyphImageCacheKey], 0, len(c.caches))
+	for _, e := range c.caches {
+		caches = append(caches, e.cache)
+	}
+	c.mu.Unlock()
+	n := 0
+	for _, cache := range caches {
+		n += cache.len()
+	}
+	return n
 }
 
 // runeToBoolMap is a map from rune to bool with performance optimizations.
@@ -395,7 +445,13 @@ type GoTextFaceSource struct {
 
 	bitmapSizesResult []font.BitmapSize
 	bitmapSizesOnce   sync.Once
+
+	// familyID identifies this source for glyph budget pinning.
+	familyID uint64
 }
+
+// goTextFamilyID hands out process-wide family ids for GoTextFaceSource caches.
+var goTextFamilyID uint64
 
 func toFontResource(source io.Reader) (font.Resource, error) {
 	// font.Resource has io.Seeker and io.ReaderAt in addition to io.Reader.
@@ -421,6 +477,8 @@ func newGoTextFaceSource(face *font.Face, loader *opentype.Loader) *GoTextFaceSo
 		svgFont: loadSVGFont(loader),
 	}
 	s.addr = s
+	goTextFamilyID++
+	s.familyID = goTextFamilyID
 	s.metadata = metadataFromFace(face)
 	s.variationAxes = variationAxesFromLoader(loader)
 	s.outputCache = newCache[goTextOutputCacheKey, *goTextOutputCacheValue](512)
@@ -1370,6 +1428,46 @@ func (g *GoTextFaceSource) scale(size float64) float64 {
 
 func (g *GoTextFaceSource) getOrCreateGlyphImage(size float64, variationCount int, key goTextGlyphImageCacheKey, create func() (*ebiten.Image, bool)) *ebiten.Image {
 	return g.glyphImageCache.getOrCreate(size, variationCount, key, create)
+}
+
+// ID returns the opaque identifier of the source's font family.
+//
+// Use the value with [GlyphAtlasBudget.PinFamily] to keep this source's
+// glyphs resident. All [GoTextFace] values sharing the source also share the
+// id, so one pin covers every size and variation of the font.
+func (g *GoTextFaceSource) ID() uint64 {
+	g.copyCheck()
+	return g.familyID
+}
+
+// SetGlyphAtlasBudget attaches a [GlyphAtlasBudget] to the source's glyph
+// image caches, replacing any previously attached budget. Passing nil
+// detaches the current budget and restores the built-in soft limits.
+//
+// The budget bounds the GPU memory used by the source's rasterized glyphs
+// across every face size. Attaching a budget never discards the currently
+// cached glyphs; they are migrated into the budget and evicted from then on
+// according to its limits.
+//
+// SetGlyphAtlasBudget is safe to call concurrently with drawing.
+func (g *GoTextFaceSource) SetGlyphAtlasBudget(budget *GlyphAtlasBudget) {
+	g.copyCheck()
+	g.glyphImageCache.setBudget(budget, g.familyID)
+}
+
+// GlyphAtlasBudget returns the budget attached to the source, or nil.
+func (g *GoTextFaceSource) GlyphAtlasBudget() *GlyphAtlasBudget {
+	g.copyCheck()
+	return g.glyphImageCache.budget
+}
+
+// ClearGlyphCache drops the source's cached glyph images for every face
+// size. Subsequent drawing regenerates any needed glyph, producing pixels
+// identical to the removed ones. Glyphs currently used by an in-flight draw
+// stay alive until that draw completes.
+func (g *GoTextFaceSource) ClearGlyphCache() {
+	g.copyCheck()
+	g.glyphImageCache.clear()
 }
 
 // metrics returns face's metrics in pixels. Default coordinates scale

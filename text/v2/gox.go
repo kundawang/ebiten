@@ -46,7 +46,7 @@ type goXFaceGlyphImageCacheKey struct {
 type GoXFace struct {
 	f *faceWithCache
 
-	glyphImageCache *cache[goXFaceGlyphImageCacheKey, *ebiten.Image]
+	glyphImageCache *imageCache[goXFaceGlyphImageCacheKey]
 
 	// cachedMetrics is guarded by cachedMetricsMu.
 	cachedMetrics   Metrics
@@ -54,8 +54,14 @@ type GoXFace struct {
 
 	originXCache *cache[string, []fixed.Int26_6]
 
+	// familyID identifies this face's font for glyph budget pinning.
+	familyID uint64
+
 	addr *GoXFace
 }
+
+// goXFamilyID hands out process-wide family ids for GoXFace caches.
+var goXFamilyID uint64
 
 // NewGoXFace creates a new GoXFace from a semi-standard font.Face.
 func NewGoXFace(face font.Face) *GoXFace {
@@ -66,9 +72,50 @@ func NewGoXFace(face font.Face) *GoXFace {
 	}
 	// Set addr as early as possible. This is necessary for glyphVariationCount.
 	g.addr = g
-	g.glyphImageCache = newCache[goXFaceGlyphImageCacheKey, *ebiten.Image](128 * glyphVariationCount(g))
+	g.glyphImageCache = newImageCache[goXFaceGlyphImageCacheKey](128 * glyphVariationCount(g))
 	g.originXCache = newCache[string, []fixed.Int26_6](512)
+	goXFamilyID++
+	g.familyID = goXFamilyID
 	return g
+}
+
+// ID returns the opaque identifier of the face's font family.
+//
+// Use the value with [GlyphAtlasBudget.PinFamily] to keep this face's glyphs
+// resident. Every GoXFace has its own family id, even two faces wrapping the
+// same underlying font.Face.
+func (g *GoXFace) ID() uint64 {
+	g.copyCheck()
+	return g.familyID
+}
+
+// SetGlyphAtlasBudget attaches a [GlyphAtlasBudget] to the face's glyph
+// image cache, replacing any previously attached budget. Passing nil
+// detaches the current budget and restores the built-in soft limit.
+//
+// The budget bounds the GPU memory used by this face's rasterized glyphs.
+// Attaching a budget never discards the currently cached glyphs; they are
+// migrated into the budget and evicted from then on according to its limits.
+//
+// SetGlyphAtlasBudget is safe to call concurrently with drawing.
+func (g *GoXFace) SetGlyphAtlasBudget(budget *GlyphAtlasBudget) {
+	g.copyCheck()
+	g.glyphImageCache.setBudget(budget, g.familyID)
+}
+
+// GlyphAtlasBudget returns the budget attached to the face, or nil.
+func (g *GoXFace) GlyphAtlasBudget() *GlyphAtlasBudget {
+	g.copyCheck()
+	return g.glyphImageCache.budget
+}
+
+// ClearGlyphCache drops the face's cached glyph images. Subsequent drawing
+// regenerates any needed glyph, producing pixels identical to the removed
+// ones. Glyphs currently used by an in-flight draw stay alive until that
+// draw completes.
+func (g *GoXFace) ClearGlyphCache() {
+	g.copyCheck()
+	g.glyphImageCache.clear()
 }
 
 func (g *GoXFace) copyCheck() {
@@ -273,18 +320,39 @@ type goXGlyphImageArgs struct {
 	bounds         fixed.Rectangle26_6
 }
 
-// glyphImage implements glyphImager.
-func (im *goXLineImager) glyphImage(index int) *ebiten.Image {
+// glyphImage implements glyphImager. The returned lease is nil when the
+// cache has no budget or the glyph bypassed the cache.
+func (im *goXLineImager) glyphImage(index int) (*ebiten.Image, glyphLease) {
 	args := &im.args[index]
 	face := im.face
 	key := goXFaceGlyphImageCacheKey{
 		rune:    args.rune,
 		xoffset: args.subpixelOffset.X,
 	}
-	return face.glyphImageCache.getOrCreate(key, func() (*ebiten.Image, bool) {
+	// Fast path: take a lease so an attached budget cannot evict the image
+	// while the caller still intends to draw it.
+	if img, lease := face.glyphImageCache.acquire(key); img != nil {
+		return img, lease
+	}
+	img := face.glyphImageCache.getOrCreate(key, func() (*ebiten.Image, bool) {
 		img := face.glyphImageImpl(args.rune, args.subpixelOffset, args.bounds)
 		return img, img != nil
 	})
+	// The freshly created image may have bypassed the cache as oversized;
+	// only take a lease when it actually entered.
+	if img2, lease := face.glyphImageCache.acquire(key); img2 != nil {
+		return img2, lease
+	}
+	return img, nil
+}
+
+// releaseLease implements glyphImager.
+func (im *goXLineImager) releaseLease(lease glyphLease) {
+	l, ok := lease.(*lruEntry)
+	if !ok || l == nil {
+		return
+	}
+	l.release()
 }
 
 // glyphColored implements glyphImager. A GoXFace glyph is always a
