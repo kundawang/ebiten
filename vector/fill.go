@@ -63,6 +63,15 @@ type FillOptions struct {
 	// FillRule is the rule whether an overlapped region is rendered or not.
 	// The default (zero) value is FillRuleNonZero.
 	FillRule FillRule
+
+	// TessellationQuality controls how the path's curves are adaptively subdivided into
+	// line segments before filling.
+	//
+	// The default (nil) value uses the standard tessellation, which keeps the historical
+	// geometry unchanged. A non-nil quality flattens the path with that quality and renders
+	// the resulting line segments, so the same quality can be shared with [StrokePath] and
+	// [Path.PathBounds] for one consistent subdivision strategy.
+	TessellationQuality *VectorTessellationQuality
 }
 
 // DrawPathOptions is options to draw a path.
@@ -107,6 +116,16 @@ func FillPath(dst *ebiten.Image, path *Path, fillOptions *FillOptions, drawPathO
 	}
 	if fillOptions == nil {
 		fillOptions = &FillOptions{}
+	}
+
+	// A non-default quality flattens the curves into line segments first. The default quality is
+	// handled by the standard pipeline so existing geometry is unchanged.
+	if q := fillOptions.TessellationQuality; q != nil && !q.isDefault() {
+		flattened := flattenToPath(path, q)
+		if len(flattened.subPaths) == 0 {
+			return
+		}
+		path = flattened
 	}
 
 	paint := snapshotPaint(drawPathOptions.Paint, dst)

@@ -65,6 +65,14 @@ type StrokeOptions struct {
 	//
 	// The default (zero) value is 0, which renders every join as a bevel join.
 	MiterLimit float32
+
+	// TessellationQuality controls how the path's curves are adaptively subdivided into
+	// line segments before the stroke outline is built.
+	//
+	// The default (nil) value uses the standard tessellation, which keeps the historical
+	// geometry unchanged. A non-nil quality first flattens the path with that quality, so the
+	// same quality can be shared with [FillPath] and [Path.PathBounds].
+	TessellationQuality *VectorTessellationQuality
 }
 
 // AddStrokeOptions is options for [Path.AddStroke].
@@ -100,22 +108,32 @@ func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
 
 	halfWidth := float64(options.Width) / 2
 
+	// A non-default quality flattens the source curves into line segments before building the
+	// stroke outline. The default quality keeps the historical geometry unchanged.
+	srcForStroke := src
+	if q := options.TessellationQuality; q != nil && !q.isDefault() {
+		srcForStroke = flattenToPath(src, q)
+		if len(srcForStroke.subPaths) == 0 {
+			return
+		}
+	}
+
 	// p might be the same as src. Use srcN to avoid modifying the overlapped region.
-	srcN := len(src.subPaths)
+	srcN := len(srcForStroke.subPaths)
 
 	// origN is the index of the first sub-path added by this call. MoveTo does not always add a new sub-path, so
 	// origN is determined right after the first MoveTo.
 	origN := -1
 
 	// Normalize each source sub-path to simplify the logic to generate a stroke path.
-	// Normalize into a scratch sub-path so that src is not modified. p.opsBuf is reused as its operations.
+	// Normalize into a scratch sub-path so that the source is not modified. p.opsBuf is reused as its operations.
 	normalized := subPath{ops: p.opsBuf[:0]}
-	for i := range src.subPaths[:srcN] {
-		// When p is src, the sub-paths at origN and later are stroke output, not sources.
+	for i := range srcForStroke.subPaths[:srcN] {
+		// When p is the source, the sub-paths at origN and later are stroke output, not sources.
 		if src == p && origN >= 0 && i >= origN {
 			break
 		}
-		normalizeSubPath(&normalized, &src.subPaths[i])
+		normalizeSubPath(&normalized, &srcForStroke.subPaths[i])
 		if len(normalized.ops) == 0 {
 			continue
 		}
