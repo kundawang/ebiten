@@ -33,6 +33,12 @@ func canUseMipmap(imageType atlas.ImageType) bool {
 	return false
 }
 
+// maxLevelImageSize is the maximum width and height of a mipmap level image.
+// atlas.NewImage panics with a too big size when actual allocation happens.
+// 4096 should be a safe size in most environments (#1399).
+// Unfortunately a precise max image size cannot be obtained here since this requires GPU access.
+const maxLevelImageSize = 4096
+
 // Mipmap is a set of atlas.Image indexed by the mipmap level.
 // The level 0 image is a regular image and higher-level images are used for mipmap.
 type Mipmap struct {
@@ -41,6 +47,11 @@ type Mipmap struct {
 	imageType atlas.ImageType
 	orig      *atlas.Image
 	imgs      map[int]imageWithDirtyFlag
+
+	// epoch is incremented every time the mipmap is deallocated. Prefetch plans capture the
+	// epoch at creation time to detect that the underlying images were rebuilt (e.g. after a
+	// device loss) and that the plan is stale.
+	epoch uint64
 }
 
 type imageWithDirtyFlag struct {
@@ -208,10 +219,7 @@ func (m *Mipmap) level(level int) *atlas.Image {
 		m.setImg(level, nil)
 		return nil
 	}
-	// atlas.NewImage panics with a too big size when actual allocation happens.
-	// 4096 should be a safe size in most environments (#1399).
-	// Unfortunately a precise max image size cannot be obtained here since this requires GPU access.
-	if dstW > 4096 || dstH > 4096 {
+	if dstW > maxLevelImageSize || dstH > maxLevelImageSize {
 		m.setImg(level, nil)
 		return nil
 	}
@@ -263,6 +271,7 @@ func (m *Mipmap) Deallocate() {
 	}
 	clear(m.imgs)
 	m.orig.Deallocate()
+	m.epoch++
 }
 
 // mipmapLevelFromDistance returns an appropriate mipmap level for the given distance.

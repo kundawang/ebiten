@@ -23,3 +23,8 @@ var MipmapLevelFromDistance = mipmapLevelFromDistance
 func (m *Mipmap) RegionForLevel(region image.Rectangle, level int) image.Rectangle {
 	return m.regionForLevel(region, level)
 }
+
+// EpochForTesting returns the mipmap's current epoch.
+func (m *Mipmap) EpochForTesting() uint64 {
+	return m.epoch
+}
