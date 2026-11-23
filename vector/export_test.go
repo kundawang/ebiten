@@ -150,3 +150,28 @@ func UtilDrawingVertices(draw func()) []ebiten.Vertex {
 	defer theCacheForUtilM.Unlock()
 	return append([]ebiten.Vertex(nil), theCachedVerticesForUtil...)
 }
+
+// NewStrokeDashPlanForTest exposes NewStrokeDashPlan for external test packages.
+func NewStrokeDashPlanForTest(dashes []float32, offset float32) (*StrokeDashPlan, error) {
+	return NewStrokeDashPlan(dashes, offset)
+}
+
+// QuadArcLengthForTest exposes the quadratic arc-length integrator.
+func QuadArcLengthForTest(p0, p1, p2 Point) float64 {
+	return quadArcLength(point{x: float64(p0.X), y: float64(p0.Y)},
+		point{x: float64(p1.X), y: float64(p1.Y)},
+		point{x: float64(p2.X), y: float64(p2.Y)})
+}
+
+// QuadTForLengthForTest exposes the arc-length inversion of a quadratic curve.
+func QuadTForLengthForTest(p0, p1, p2 Point, length, target float64) float64 {
+	return quadTForLength(point{x: float64(p0.X), y: float64(p0.Y)},
+		point{x: float64(p1.X), y: float64(p1.Y)},
+		point{x: float64(p2.X), y: float64(p2.Y)}, length, target)
+}
+
+// BuildDashedPathForTest materializes the dashed source path of src for inspection.
+func BuildDashedPathForTest(dst, src *Path, plan *StrokeDashPlan) {
+	var b dashBuilder
+	b.buildDashedPath(dst, src, plan)
+}

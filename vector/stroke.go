@@ -65,6 +65,19 @@ type StrokeOptions struct {
 	//
 	// The default (zero) value is 0, which renders every join as a bevel join.
 	MiterLimit float32
+
+	// Dash is an optional [StrokeDashPlan] that turns the stroke into a dashed stroke.
+	// Dash gaps and dashes are measured against the true arc length of the path, so they
+	// stay uniform across lines, quadratic and cubic curves, and arcs.
+	//
+	// When Dash is nil, the stroke is solid. A non-nil Dash never changes the geometry of a
+	// solid stroke: with no active gap the produced outline is identical to the un-dashed one.
+	//
+	// Caps are applied to the ends of every dash; joins, the miter limit, and GeoM are
+	// applied exactly as for a solid stroke.
+	//
+	// The default (zero) value is nil, which renders a solid stroke.
+	Dash *StrokeDashPlan
 }
 
 // AddStrokeOptions is options for [Path.AddStroke].
@@ -80,6 +93,9 @@ type AddStrokeOptions struct {
 
 // AddStroke adds a stroke path to the path p.
 // After validating the width, AddStroke does nothing if the geometry matrix has an infinite or NaN element.
+//
+// When options.Dash is non-nil, the source is split into dashed sub-paths in arc-length
+// space before stroking. A pattern that degenerates to no visible dashes adds nothing.
 //
 // The added stroke path must be rendered with FillRuleNonZero.
 func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
@@ -100,6 +116,36 @@ func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
 
 	halfWidth := float64(options.Width) / 2
 
+	// Build the effective source. Without a dash plan it is src itself. With a plan it is a
+	// scratch path holding only the dashed sub-paths, so the original stroke logic below is
+	// reused unchanged (caps, joins, miter limit, and the geometry matrix all still apply).
+	// The scratch path lives on this frame and never escapes, so AddStroke remains safe to
+	// call concurrently on distinct paths.
+	if plan := options.Dash; plan != nil {
+		if plan.DrawsNothing() {
+			// The pattern consists only of gaps, so no dashed stroke is visible.
+			return
+		}
+		if !plan.IsContinuous() {
+			var dashed Path
+			builder := dashBuilderPool.Get().(*dashBuilder)
+			builder.buildDashedPath(&dashed, src, plan)
+			dashBuilderPool.Put(builder)
+			if len(dashed.subPaths) == 0 {
+				return
+			}
+			p.appendStroke(&dashed, &options.StrokeOptions, halfWidth, &options.GeoM)
+			return
+		}
+		// A pattern with no gap is the solid stroke.
+	}
+
+	p.appendStroke(src, &options.StrokeOptions, halfWidth, &options.GeoM)
+}
+
+// appendStroke appends the stroked outline of src to p.
+// The width and the regularity of geoM have already been validated by the caller.
+func (p *Path) appendStroke(src *Path, options *StrokeOptions, halfWidth float64, geoM *ebiten.GeoM) {
 	// p might be the same as src. Use srcN to avoid modifying the overlapped region.
 	srcN := len(src.subPaths)
 
@@ -129,7 +175,7 @@ func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
 			origN = len(p.subPaths) - 1
 		}
 
-		appendParalleledPathFromSubPath(p, &normalized, &options.StrokeOptions)
+		appendParalleledPathFromSubPath(p, &normalized, options)
 		_, ep1, ep2, ep3, ep4 := strokeEndControlPositions(&normalized, halfWidth)
 		if normalized.closed {
 			p.Close()
@@ -147,7 +193,7 @@ func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
 				p.lineTo(ep4.x, ep4.y)
 			}
 		}
-		appendParalleledPathFromSubPathReversed(p, &normalized, &options.StrokeOptions)
+		appendParalleledPathFromSubPathReversed(p, &normalized, options)
 		if !normalized.closed {
 			switch options.LineCap {
 			case LineCapButt:
@@ -165,9 +211,9 @@ func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
 	}
 	p.opsBuf = normalized.ops[:0]
 
-	if origN >= 0 && options.GeoM != (ebiten.GeoM{}) {
+	if origN >= 0 && *geoM != (ebiten.GeoM{}) {
 		for i, subPath := range p.subPaths[origN:] {
-			x, y := options.GeoM.Apply(subPath.start.x, subPath.start.y)
+			x, y := geoM.Apply(subPath.start.x, subPath.start.y)
 			p.subPaths[origN+i].start = point{
 				x: x,
 				y: y,
@@ -175,14 +221,14 @@ func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
 			for j, op := range subPath.ops {
 				switch op.typ {
 				case opTypeLineTo:
-					x1, y1 := options.GeoM.Apply(op.p1.x, op.p1.y)
+					x1, y1 := geoM.Apply(op.p1.x, op.p1.y)
 					p.subPaths[origN+i].ops[j].p1 = point{
 						x: x1,
 						y: y1,
 					}
 				case opTypeQuadTo:
-					x1, y1 := options.GeoM.Apply(op.p1.x, op.p1.y)
-					x2, y2 := options.GeoM.Apply(op.p2.x, op.p2.y)
+					x1, y1 := geoM.Apply(op.p1.x, op.p1.y)
+					x2, y2 := geoM.Apply(op.p2.x, op.p2.y)
 					p.subPaths[origN+i].ops[j].p1 = point{
 						x: x1,
 						y: y1,
