@@ -135,8 +135,44 @@ func mustUseDifferentVertexBuffer(nextNumVertexFloats int) bool {
 	return nextNumVertexFloats > maxVertexFloatCount
 }
 
+// numDrawTrianglesCommands is the total number of created draw-triangles commands.
+// Merged commands are not counted. This is for testing only.
+var numDrawTrianglesCommands atomic.Int64
+
+// numDrawTrianglesEnqueues is the total number of EnqueueDrawTrianglesCommand calls,
+// including calls merged into an existing command. This is for testing only.
+var numDrawTrianglesEnqueues atomic.Int64
+
+// NumDrawTrianglesCommandsForTesting returns the number of draw-triangles commands
+// created so far, not counting commands merged into an existing command.
+//
+// This is for testing only. Do not use this in production.
+func NumDrawTrianglesCommandsForTesting() int64 {
+	return numDrawTrianglesCommands.Load()
+}
+
+// NumDrawTrianglesEnqueuesForTesting returns the number of
+// EnqueueDrawTrianglesCommand calls so far, including calls merged into an
+// existing command.
+//
+// This is for testing only. Do not use this in production.
+func NumDrawTrianglesEnqueuesForTesting() int64 {
+	return numDrawTrianglesEnqueues.Load()
+}
+
+// ResetNumDrawTrianglesCommandsForTesting resets the counters of
+// NumDrawTrianglesCommandsForTesting and NumDrawTrianglesEnqueuesForTesting.
+//
+// This is for testing only. Do not use this in production.
+func ResetNumDrawTrianglesCommandsForTesting() {
+	numDrawTrianglesCommands.Store(0)
+	numDrawTrianglesEnqueues.Store(0)
+}
+
 // EnqueueDrawTrianglesCommand enqueues a drawing-image command.
 func (q *commandQueue) EnqueueDrawTrianglesCommand(dst *Image, srcs [graphics.ShaderSrcImageCount]*Image, vertices []float32, indices []uint32, blend graphicsdriver.Blend, dstRegion image.Rectangle, srcRegions [graphics.ShaderSrcImageCount]image.Rectangle, shader *Shader, uniforms []uint32) {
+	numDrawTrianglesEnqueues.Add(1)
+
 	if len(vertices) > maxVertexFloatCount {
 		panic(fmt.Sprintf("graphicscommand: len(vertices) must equal to or less than %d but was %d", maxVertexFloatCount, len(vertices)))
 	}
@@ -201,6 +237,7 @@ func (q *commandQueue) EnqueueDrawTrianglesCommand(dst *Image, srcs [graphics.Sh
 		}
 	}
 	q.commands = append(q.commands, c)
+	numDrawTrianglesCommands.Add(1)
 }
 
 // Enqueue enqueues a drawing command other than a draw-triangles command.

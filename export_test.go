@@ -14,12 +14,32 @@
 
 package ebiten
 
-import "github.com/hajimehoshi/ebiten/v2/internal/builtinshader"
+import (
+	"github.com/hajimehoshi/ebiten/v2/internal/builtinshader"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicscommand"
+)
 
 var (
 	ImageToBytes   = imageToBytes
 	ToUIRunOptions = toUIRunOptions
 )
+
+var (
+	NumDrawTrianglesCommandsForTesting      = graphicscommand.NumDrawTrianglesCommandsForTesting
+	NumDrawTrianglesEnqueuesForTesting      = graphicscommand.NumDrawTrianglesEnqueuesForTesting
+	ResetNumDrawTrianglesCommandsForTesting = graphicscommand.ResetNumDrawTrianglesCommandsForTesting
+)
+
+// SetDrawImageBatchMaxVertexCountForTesting sets the maximum number of vertices in one
+// internal draw call issued by (*Image).DrawImageBatch, and returns a function to
+// restore the previous value.
+func SetDrawImageBatchMaxVertexCountForTesting(n int) func() {
+	prev := drawImageBatchMaxVertexCount
+	drawImageBatchMaxVertexCount = n
+	return func() {
+		drawImageBatchMaxVertexCount = prev
+	}
+}
 
 func SetPanicOnErrorOnReadingPixelsForTesting(value bool) {
 	panicOnErrorOnReadingPixels = value
