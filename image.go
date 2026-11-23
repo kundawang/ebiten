@@ -594,7 +594,25 @@ func (i *Image) DrawTriangles(vertices []Vertex, indices []uint16, img *Image, o
 	for i := range is {
 		is[i] = uint32(indices[i])
 	}
-	i.DrawTriangles32(vertices, is, img, options)
+	i.drawTriangles32(vertexSlice(vertices), is, img, options)
+}
+
+// DrawTrianglesWithView is like [Image.DrawTriangles] but takes the vertices
+// from a [VertexBufferView] instead of a complete []Vertex slice.
+//
+// The view's visible vertices (see [VertexBufferView.Len]) play the role of
+// the vertices argument, and indices are relative to the first visible vertex.
+// The drawing result is identical to passing a copied slice containing exactly
+// the view's visible vertices.
+func (i *Image) DrawTrianglesWithView(vertices *VertexBufferView, indices []uint16, img *Image, options *DrawTrianglesOptions) {
+	if vertices == nil {
+		panic("ebiten: the given vertex buffer view to DrawTrianglesWithView must not be nil")
+	}
+	is := i.ensureTmpIndices(len(indices))
+	for i := range is {
+		is[i] = uint32(indices[i])
+	}
+	i.drawTriangles32(vertices, is, img, options)
 }
 
 // DrawTriangles32 draws triangles with the specified vertices and their indices.
@@ -622,6 +640,24 @@ func (i *Image) DrawTriangles(vertices []Vertex, indices []uint16, img *Image, o
 //
 // When the image i is disposed and the given image is not, DrawTriangles32 does nothing.
 func (i *Image) DrawTriangles32(vertices []Vertex, indices []uint32, img *Image, options *DrawTrianglesOptions) {
+	i.drawTriangles32(vertexSlice(vertices), indices, img, options)
+}
+
+// DrawTriangles32WithView is like [Image.DrawTriangles32] but takes the
+// vertices from a [VertexBufferView] instead of a complete []Vertex slice.
+//
+// The view's visible vertices (see [VertexBufferView.Len]) play the role of
+// the vertices argument, and indices are relative to the first visible vertex.
+// The drawing result is identical to passing a copied slice containing exactly
+// the view's visible vertices.
+func (i *Image) DrawTriangles32WithView(vertices *VertexBufferView, indices []uint32, img *Image, options *DrawTrianglesOptions) {
+	if vertices == nil {
+		panic("ebiten: the given vertex buffer view to DrawTriangles32WithView must not be nil")
+	}
+	i.drawTriangles32(vertices, indices, img, options)
+}
+
+func (i *Image) drawTriangles32(source vertexSource, indices []uint32, img *Image, options *DrawTrianglesOptions) {
 	i.copyCheck()
 
 	if img == nil {
@@ -649,7 +685,7 @@ func (i *Image) DrawTriangles32(vertices []Vertex, indices []uint32, img *Image,
 	}
 
 	if options != nil && (options.FillRule != FillRuleFillAll || options.AntiAlias) && !i.Bounds().Empty() {
-		drawTrianglesWithStencilBuffer(i, vertices, indices, img, options)
+		drawTrianglesWithStencilBuffer(i, source.materializeVertices(), indices, img, options)
 		return
 	}
 
@@ -659,16 +695,17 @@ func (i *Image) DrawTriangles32(vertices []Vertex, indices []uint32, img *Image,
 	img.updateAccessTime()
 	i.updateAccessTime()
 
-	if len(vertices) > graphicscommand.MaxVertexCount {
+	if n := source.vertexCount(); n > graphicscommand.MaxVertexCount {
 		// The last part cannot be specified by indices. Just omit them.
-		vertices = vertices[:graphicscommand.MaxVertexCount]
+		source = source.clampedVertexSource(graphicscommand.MaxVertexCount)
 	}
+	vertexCount := source.vertexCount()
 	if len(indices)%3 != 0 {
 		panic("ebiten: len(indices) % 3 must be 0")
 	}
 	for i, idx := range indices {
-		if idx >= uint32(len(vertices)) {
-			panic(fmt.Sprintf("ebiten: indices[%d] must be less than len(vertices) (%d) but was %d", i, len(vertices), idx))
+		if idx >= uint32(vertexCount) {
+			panic(fmt.Sprintf("ebiten: indices[%d] must be less than len(vertices) (%d) but was %d", i, vertexCount, idx))
 		}
 	}
 
@@ -688,38 +725,11 @@ func (i *Image) DrawTriangles32(vertices []Vertex, indices []uint32, img *Image,
 
 	colorm, cr, cg, cb, ca := colorMToScale(options.ColorM.affineColorM())
 
-	vs := i.ensureTmpVertices(len(vertices) * graphics.VertexFloatCount)
+	i.tmpVertices = i.tmpVertices[:0]
 	dox, doy := i.originF32()
 	sox, soy := img.originF32()
-	if options.ColorScaleMode == ColorScaleModeStraightAlpha {
-		// Avoid using `for i, v := range vertices` as adding `v` creates a copy from `vertices` unnecessarily on each loop (#3103).
-		for i := range vertices {
-			// Create a temporary slice to reduce boundary checks.
-			vs := vs[i*graphics.VertexFloatCount : i*graphics.VertexFloatCount+8]
-			vs[0] = vertices[i].DstX - dox
-			vs[1] = vertices[i].DstY - doy
-			vs[2] = vertices[i].SrcX - sox
-			vs[3] = vertices[i].SrcY - soy
-			vs[4] = vertices[i].ColorR * vertices[i].ColorA * cr
-			vs[5] = vertices[i].ColorG * vertices[i].ColorA * cg
-			vs[6] = vertices[i].ColorB * vertices[i].ColorA * cb
-			vs[7] = vertices[i].ColorA * ca
-		}
-	} else {
-		// See comment above (#3103).
-		for i := range vertices {
-			// Create a temporary slice to reduce boundary checks.
-			vs := vs[i*graphics.VertexFloatCount : i*graphics.VertexFloatCount+8]
-			vs[0] = vertices[i].DstX - dox
-			vs[1] = vertices[i].DstY - doy
-			vs[2] = vertices[i].SrcX - sox
-			vs[3] = vertices[i].SrcY - soy
-			vs[4] = vertices[i].ColorR * cr
-			vs[5] = vertices[i].ColorG * cg
-			vs[6] = vertices[i].ColorB * cb
-			vs[7] = vertices[i].ColorA * ca
-		}
-	}
+	i.tmpVertices = source.appendVertexFloatsForDraw(i.tmpVertices, dox, doy, sox, soy, cr, cg, cb, ca, options.ColorScaleMode == ColorScaleModeStraightAlpha)
+	vs := i.tmpVertices
 
 	srcs := [graphics.ShaderSrcImageCount]*bufferedImage{img.image}
 
@@ -831,7 +841,25 @@ func (i *Image) DrawTrianglesShader(vertices []Vertex, indices []uint16, shader 
 	for i := range is {
 		is[i] = uint32(indices[i])
 	}
-	i.DrawTrianglesShader32(vertices, is, shader, options)
+	i.drawTrianglesShader32(vertexSlice(vertices), is, shader, options)
+}
+
+// DrawTrianglesShaderWithView is like [Image.DrawTrianglesShader] but takes the
+// vertices from a [VertexBufferView] instead of a complete []Vertex slice.
+//
+// The view's visible vertices (see [VertexBufferView.Len]) play the role of
+// the vertices argument, and indices are relative to the first visible vertex.
+// The drawing result is identical to passing a copied slice containing exactly
+// the view's visible vertices.
+func (i *Image) DrawTrianglesShaderWithView(vertices *VertexBufferView, indices []uint16, shader *Shader, options *DrawTrianglesShaderOptions) {
+	if vertices == nil {
+		panic("ebiten: the given vertex buffer view to DrawTrianglesShaderWithView must not be nil")
+	}
+	is := i.ensureTmpIndices(len(indices))
+	for i := range is {
+		is[i] = uint32(indices[i])
+	}
+	i.drawTrianglesShader32(vertices, is, shader, options)
 }
 
 // DrawTrianglesShader32 draws triangles with the specified vertices and their indices with the specified shader.
@@ -865,6 +893,24 @@ func (i *Image) DrawTrianglesShader(vertices []Vertex, indices []uint16, shader 
 //
 // When the image i is disposed and no disposed shader or image is given, DrawTrianglesShader32 does nothing.
 func (i *Image) DrawTrianglesShader32(vertices []Vertex, indices []uint32, shader *Shader, options *DrawTrianglesShaderOptions) {
+	i.drawTrianglesShader32(vertexSlice(vertices), indices, shader, options)
+}
+
+// DrawTrianglesShader32WithView is like [Image.DrawTrianglesShader32] but takes
+// the vertices from a [VertexBufferView] instead of a complete []Vertex slice.
+//
+// The view's visible vertices (see [VertexBufferView.Len]) play the role of
+// the vertices argument, and indices are relative to the first visible vertex.
+// The drawing result is identical to passing a copied slice containing exactly
+// the view's visible vertices.
+func (i *Image) DrawTrianglesShader32WithView(vertices *VertexBufferView, indices []uint32, shader *Shader, options *DrawTrianglesShaderOptions) {
+	if vertices == nil {
+		panic("ebiten: the given vertex buffer view to DrawTrianglesShader32WithView must not be nil")
+	}
+	i.drawTrianglesShader32(vertices, indices, shader, options)
+}
+
+func (i *Image) drawTrianglesShader32(source vertexSource, indices []uint32, shader *Shader, options *DrawTrianglesShaderOptions) {
 	i.copyCheck()
 
 	if shader.isDisposed() {
@@ -893,7 +939,7 @@ func (i *Image) DrawTrianglesShader32(vertices []Vertex, indices []uint32, shade
 	}
 
 	if options != nil && (options.FillRule != FillRuleFillAll || options.AntiAlias) && !i.Bounds().Empty() {
-		drawTrianglesShaderWithStencilBuffer(i, vertices, indices, shader, options)
+		drawTrianglesShaderWithStencilBuffer(i, source.materializeVertices(), indices, shader, options)
 		return
 	}
 
@@ -917,16 +963,17 @@ func (i *Image) DrawTrianglesShader32(vertices []Vertex, indices []uint32, shade
 	}
 	i.updateAccessTime()
 
-	if len(vertices) > graphicscommand.MaxVertexCount {
+	if n := source.vertexCount(); n > graphicscommand.MaxVertexCount {
 		// The last part cannot be specified by indices. Just omit them.
-		vertices = vertices[:graphicscommand.MaxVertexCount]
+		source = source.clampedVertexSource(graphicscommand.MaxVertexCount)
 	}
+	vertexCount := source.vertexCount()
 	if len(indices)%3 != 0 {
 		panic("ebiten: len(indices) % 3 must be 0")
 	}
 	for i, idx := range indices {
-		if idx >= uint32(len(vertices)) {
-			panic(fmt.Sprintf("ebiten: indices[%d] must be less than len(vertices) (%d) but was %d", i, len(vertices), idx))
+		if idx >= uint32(vertexCount) {
+			panic(fmt.Sprintf("ebiten: indices[%d] must be less than len(vertices) (%d) but was %d", i, vertexCount, idx))
 		}
 	}
 
@@ -941,29 +988,14 @@ func (i *Image) DrawTrianglesShader32(vertices []Vertex, indices []uint32, shade
 		blend = options.CompositeMode.blend().internalBlend()
 	}
 
-	vs := i.ensureTmpVertices(len(vertices) * graphics.VertexFloatCount)
+	i.tmpVertices = i.tmpVertices[:0]
 	dox, doy := i.originF32()
 	var sox, soy float32
 	if src := options.Images[0]; src != nil {
 		sox, soy = src.originF32()
 	}
-	// Avoid using `for i, v := range vertices` as adding `v` creates a copy from `vertices` unnecessarily on each loop (#3103).
-	for i := range vertices {
-		// Create a temporary slice to reduce boundary checks.
-		vs := vs[i*graphics.VertexFloatCount : i*graphics.VertexFloatCount+12]
-		vs[0] = vertices[i].DstX - dox
-		vs[1] = vertices[i].DstY - doy
-		vs[2] = vertices[i].SrcX - sox
-		vs[3] = vertices[i].SrcY - soy
-		vs[4] = vertices[i].ColorR
-		vs[5] = vertices[i].ColorG
-		vs[6] = vertices[i].ColorB
-		vs[7] = vertices[i].ColorA
-		vs[8] = vertices[i].Custom0
-		vs[9] = vertices[i].Custom1
-		vs[10] = vertices[i].Custom2
-		vs[11] = vertices[i].Custom3
-	}
+	i.tmpVertices = source.appendShaderVertexFloats(i.tmpVertices, dox, doy, sox, soy)
+	vs := i.tmpVertices
 
 	var imgs [graphics.ShaderSrcImageCount]*bufferedImage
 	var imgSize image.Point

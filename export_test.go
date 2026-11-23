@@ -71,3 +71,10 @@ func (i *Image) CachedPixelsSizeForTesting() int {
 	}
 	return size
 }
+
+// TmpVerticesForTesting returns a copy of the packed float32 vertex payload of
+// the most recent draw call on this image. This is exactly the data handed to
+// the graphics command queue.
+func (i *Image) TmpVerticesForTesting() []float32 {
+	return append([]float32(nil), i.tmpVertices...)
+}
