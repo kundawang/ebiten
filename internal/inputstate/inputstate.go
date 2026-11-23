@@ -42,6 +42,21 @@ func (i *inputState) Update(fn func(*ui.InputState)) {
 	fn(&i.state)
 }
 
+// Snapshot returns a copy of the current input state.
+//
+// The copy shares no mutable memory with the internal state, so callers can hold
+// and inspect it across later updates. Unlike the per-tick consumption in the ui
+// package, Snapshot does not reset delta members like Runes or Wheel: reading the
+// state never modifies it.
+func (i *inputState) Snapshot() ui.InputState {
+	i.m.Lock()
+	defer i.m.Unlock()
+	s := i.state
+	s.Touches = append([]ui.Touch(nil), i.state.Touches...)
+	s.Runes = append([]rune(nil), i.state.Runes...)
+	return s
+}
+
 func (i *inputState) AppendInputChars(runes []rune) []rune {
 	i.m.Lock()
 	defer i.m.Unlock()
