@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "profiles": [
+    {
+      "device_guid": "0000000000000000000000000000a001",
+      "name": "Two-Stick Pad",
+      "actions": ["jump", "fire", "move_left", "move_right", "screenshot", "brake"],
+      "bindings": [
+        {"kind": "button", "index": 0, "target": "jump"},
+        {"kind": "half_axis", "index": 0, "negative": true, "target": "move_left"},
+        {"kind": "half_axis", "index": 0, "negative": false, "target": "move_right"},
+        {"kind": "hat", "index": 0, "hat_direction": 1, "target": "move_left"},
+        {"kind": "axis", "index": 4, "target": "brake"}
+      ],
+      "chord_bindings": [
+        {"buttons": [0, 1], "target": "screenshot"}
+      ],
+      "axes": [
+        {"axis": 0, "logical_axis": 0, "dead_zone": 0.2, "range_min": -1, "range_max": 1, "inverted": false},
+        {"axis": 1, "logical_axis": 1, "dead_zone": 0.15, "range_min": -1, "range_max": 1, "inverted": true},
+        {"axis": 2, "logical_axis": 2, "dead_zone": 0, "range_min": -1, "range_max": 1, "inverted": false},
+        {"axis": 3, "logical_axis": 3, "dead_zone": 0.25, "range_min": -1, "range_max": 1, "inverted": false}
+      ]
+    },
+    {
+      "device_guid": "0000000000000000000000000000a002",
+      "name": "Arcade Stick",
+      "actions": ["jump", "fire"],
+      "bindings": [
+        {"kind": "button", "index": 2, "target": "jump"},
+        {"kind": "button", "index": 3, "target": "fire"}
+      ],
+      "chord_bindings": [],
+      "axes": []
+    }
+  ]
+}
