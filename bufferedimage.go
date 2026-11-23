@@ -51,6 +51,12 @@ func init() {
 type bufferedImage struct {
 	image *ui.Image
 
+	// version is a monotonically increasing counter bumped whenever the image's pixels change
+	// or its internal state is deallocated. ImageRegionCache uses this to invalidate its entries.
+	// Since a bufferedImage is shared by an Image and all its sub-images, a write through any
+	// of them is observed through the same version.
+	version atomic.Uint64
+
 	// mu protects cache.
 	//
 	// mu is never held while waiting for a frame, since the frame might need mu to draw the image.
@@ -73,6 +79,13 @@ func (b *bufferedImage) Deallocate() {
 
 	b.image.Deallocate()
 	b.cache.deallocate()
+	b.version.Add(1)
+}
+
+// pixelsVersion returns the current version of the image's pixels.
+// The version changes whenever the pixels are modified or the internal state is deallocated.
+func (b *bufferedImage) pixelsVersion() uint64 {
+	return b.version.Load()
 }
 
 // theReadPixelsError is the first error at a synchronous pixel read.
@@ -171,6 +184,7 @@ func (b *bufferedImage) WritePixels(pix []byte, region image.Rectangle) {
 	defer b.mu.Unlock()
 
 	b.cache.writePixels(b.image, pix, region)
+	b.version.Add(1)
 }
 
 // DrawTriangles draws the src images with the given vertices.
@@ -196,6 +210,7 @@ func (b *bufferedImage) DrawTriangles(srcs [graphics.ShaderSrcImageCount]*buffer
 
 	// After rendering, the pixel cache is no longer valid.
 	b.cache.reset()
+	b.version.Add(1)
 }
 
 // Fill fills the region with the given premultiplied-alpha color.
@@ -206,6 +221,7 @@ func (b *bufferedImage) Fill(cr, cg, cb, ca float32, region image.Rectangle) {
 	b.cache.writeBackPixelsIfNeeded(b.image)
 	b.image.Fill(cr, cg, cb, ca, region)
 	b.cache.reset()
+	b.version.Add(1)
 }
 
 // drawOnUIImage calls drawer to draw on the ui.Image directly, with dstRegion as the region of the ui.Image.
@@ -216,6 +232,7 @@ func (b *bufferedImage) drawOnUIImage(drawer ui.EbitenImageDrawer, dstRegion ima
 	b.cache.writeBackPixelsIfNeeded(b.image)
 	drawer.DrawOnImage(b.image, dstRegion)
 	b.cache.reset()
+	b.version.Add(1)
 }
 
 // writeBackPixelsIfNeeded applies the pending pixel writes to the GPU.

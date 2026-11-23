@@ -132,6 +132,16 @@ func (i *Image) isSubImage() bool {
 	return i.original != nil
 }
 
+// pixelsVersion returns the version of the image's pixels.
+// The version is shared with the original image and all its sub-images, and changes
+// whenever any of them modifies the pixels. ImageRegionCache uses this for invalidation.
+func (i *Image) pixelsVersion() uint64 {
+	if i.isDisposed() {
+		return 0
+	}
+	return i.image.pixelsVersion()
+}
+
 // Clear resets the pixels of the image into 0.
 //
 // When the image is disposed, Clear does nothing.
