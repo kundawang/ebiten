@@ -51,10 +51,14 @@ const AddressCount = 3
 const (
 	UniformColorMBody        = "ColorMBody"
 	UniformColorMTranslation = "ColorMTranslation"
+
+	UniformLUTScale       = "LUTScale"
+	UniformLUTTranslation = "LUTTranslation"
+	UniformLUTGamma       = "LUTGamma"
 )
 
 var (
-	shaders  [FilterCount][AddressCount][]byte
+	shaders  [FilterCount][AddressCount][2][]byte
 	shadersM sync.Mutex
 )
 
@@ -62,14 +66,65 @@ var tmpl = template.Must(template.New("tmpl").Parse(`//kage:unit pixels
 
 package main
 
+{{if .LUT}}
+var LUTScale float
+var LUTTranslation vec4
+var LUTGamma float
+{{else}}
 var ColorMBody mat4
 var ColorMTranslation vec4
+{{end}}
 
 {{if eq .Address .AddressRepeat}}
 func adjustSrcPosForAddressRepeat(p vec2) vec2 {
 	origin := imageSrc0Origin()
 	size := imageSrc0Size()
 	return mod(p - origin, size) + origin
+}
+{{end}}
+
+{{if .LUT}}
+// lutDecode decodes a 16-bit signed fixed-point value stored in two 8-bit
+// channels. The encoded range is [-LUTScale, LUTScale].
+func lutDecode(p vec2) float {
+	return ((p.x*255.0*256.0+p.y*255.0)/65535.0*2.0 - 1.0) * LUTScale
+}
+
+// lutAccumulate applies the color transform by summing per-channel lookup
+// results. The LUT image is n texels wide and 8 texels tall. For input
+// channel j, row 2*j holds output channels 0 (RG) and 1 (BA), and row 2*j+1
+// holds output channels 2 (RG) and 3 (BA). pos is in texel units.
+//
+// imageSrc1UnsafeAt takes a position in source 0's texture space, so the
+// LUT texel positions are offset by imageSrc0Origin().
+func lutAccumulate(pos vec4) vec4 {
+	acc := LUTTranslation
+	o := imageSrc0Origin()
+	t := imageSrc1UnsafeAt(o + vec2(pos.x+0.5, 0.5))
+	acc.x += lutDecode(t.rg)
+	acc.y += lutDecode(t.ba)
+	t = imageSrc1UnsafeAt(o + vec2(pos.x+0.5, 1.5))
+	acc.z += lutDecode(t.rg)
+	acc.w += lutDecode(t.ba)
+	t = imageSrc1UnsafeAt(o + vec2(pos.y+0.5, 2.5))
+	acc.x += lutDecode(t.rg)
+	acc.y += lutDecode(t.ba)
+	t = imageSrc1UnsafeAt(o + vec2(pos.y+0.5, 3.5))
+	acc.z += lutDecode(t.rg)
+	acc.w += lutDecode(t.ba)
+	t = imageSrc1UnsafeAt(o + vec2(pos.z+0.5, 4.5))
+	acc.x += lutDecode(t.rg)
+	acc.y += lutDecode(t.ba)
+	t = imageSrc1UnsafeAt(o + vec2(pos.z+0.5, 5.5))
+	acc.z += lutDecode(t.rg)
+	acc.w += lutDecode(t.ba)
+	t = imageSrc1UnsafeAt(o + vec2(pos.w+0.5, 6.5))
+	acc.x += lutDecode(t.rg)
+	acc.y += lutDecode(t.ba)
+	t = imageSrc1UnsafeAt(o + vec2(pos.w+0.5, 7.5))
+	acc.z += lutDecode(t.rg)
+	acc.w += lutDecode(t.ba)
+	return acc
 }
 {{end}}
 
@@ -125,8 +180,18 @@ func Fragment(dstPos vec4, src0Pos vec2, color vec4) vec4 {
 	// Un-premultiply alpha.
 	// When the alpha is 0, 1-sign(alpha) is 1.0, which means division does nothing.
 	clr.rgb /= clr.a + (1-sign(clr.a))
+{{if .LUT}}
+	// Apply the color transform via the LUT.
+	q := clamp(clr, 0, 1)
+	if LUTGamma != 1.0 {
+		q = pow(q, vec4(1.0/LUTGamma))
+	}
+	n := imageSrc1Size().x
+	clr = lutAccumulate(q * (n - 1.0))
+{{else}}
 	// Apply the ColorM matrix.
 	clr = (ColorMBody * clr) + ColorMTranslation
+{{end}}
 	// Premultiply alpha
 	clr.rgb *= clr.a
 	// Apply the color scale.
@@ -140,11 +205,17 @@ func Fragment(dstPos vec4, src0Pos vec2, color vec4) vec4 {
 `))
 
 // ShaderSource returns the ColorM shader source based on the given parameters.
-func ShaderSource(filter Filter, address Address) []byte {
+// If lut is true, the shader applies the color transform through a lookup
+// table texture (source image 1) instead of a matrix.
+func ShaderSource(filter Filter, address Address, lut bool) []byte {
 	shadersM.Lock()
 	defer shadersM.Unlock()
 
-	if s := shaders[filter][address]; s != nil {
+	lutIdx := 0
+	if lut {
+		lutIdx = 1
+	}
+	if s := shaders[filter][address][lutIdx]; s != nil {
 		return s
 	}
 
@@ -158,6 +229,7 @@ func ShaderSource(filter Filter, address Address) []byte {
 		AddressUnsafe      Address
 		AddressClampToZero Address
 		AddressRepeat      Address
+		LUT                bool
 	}{
 		Filter:             filter,
 		FilterNearest:      FilterNearest,
@@ -167,11 +239,12 @@ func ShaderSource(filter Filter, address Address) []byte {
 		AddressUnsafe:      AddressUnsafe,
 		AddressClampToZero: AddressClampToZero,
 		AddressRepeat:      AddressRepeat,
+		LUT:                lut,
 	}); err != nil {
 		panic(fmt.Sprintf("colormshader: tmpl.Execute failed: %v", err))
 	}
 
 	b := buf.Bytes()
-	shaders[filter][address] = b
+	shaders[filter][address][lutIdx] = b
 	return b
 }

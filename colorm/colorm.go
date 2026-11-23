@@ -204,6 +204,7 @@ func releaseUniforms(u *uniformsPoolValue) {
 type builtinShaderKey struct {
 	filter  colormshader.Filter
 	address colormshader.Address
+	lut     bool
 }
 
 var (
@@ -211,7 +212,7 @@ var (
 	builtinShadersM sync.Mutex
 )
 
-func builtinShader(filter colormshader.Filter, address colormshader.Address) *ebiten.Shader {
+func builtinShader(filter colormshader.Filter, address colormshader.Address, lut bool) *ebiten.Shader {
 	if filter < 0 || filter >= colormshader.FilterCount {
 		panic(fmt.Sprintf("colorm: invalid filter: %d", filter))
 	}
@@ -225,12 +226,13 @@ func builtinShader(filter colormshader.Filter, address colormshader.Address) *eb
 	key := builtinShaderKey{
 		filter:  filter,
 		address: address,
+		lut:     lut,
 	}
 	if s, ok := builtinShaders[key]; ok {
 		return s
 	}
 
-	src := colormshader.ShaderSource(filter, address)
+	src := colormshader.ShaderSource(filter, address, lut)
 	s, err := ebiten.NewShader(src)
 	if err != nil {
 		panic(fmt.Sprintf("colorm: NewShader for a built-in shader failed: %v", err))

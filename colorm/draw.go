@@ -43,6 +43,16 @@ type DrawImageOptions struct {
 	// Filter is a type of texture filter.
 	// The default (zero) value is ebiten.FilterNearest.
 	Filter ebiten.Filter
+
+	// LUT is an optional lookup table used to apply the color transform.
+	//
+	// When LUT is non-nil, the colorM argument is ignored and the transform
+	// is applied through the LUT instead of an exact per-pixel matrix
+	// multiplication. This can be faster when the same transform is applied
+	// repeatedly, at the cost of a small quantization error.
+	//
+	// The default (zero) value is nil, which uses the exact matrix mode.
+	LUT *ColorTransformLUT
 }
 
 // DrawImage draws src onto dst.
@@ -64,11 +74,50 @@ func DrawImage(dst, src *ebiten.Image, colorM ColorM, op *DrawImageOptions) {
 	opShader.ColorScale = op.ColorScale
 	opShader.CompositeMode = ebiten.CompositeModeCustom
 	opShader.Blend = op.Blend
+	opShader.Images[0] = src
+	if op.LUT != nil {
+		// DrawRectShader requires all the source images to be the same size
+		// as the rectangle, which the LUT image is not. Draw a quad with
+		// DrawTrianglesShader instead; this is equivalent to DrawRectShader
+		// with the GeoM and ColorScale applied to the vertices.
+		snap, img := op.LUT.drawState()
+		u := acquireLUTUniforms(snap)
+		defer releaseLUTUniforms(u)
+
+		w, h := src.Bounds().Dx(), src.Bounds().Dy()
+		sx0, sy0 := float32(src.Bounds().Min.X), float32(src.Bounds().Min.Y)
+		sx1, sy1 := float32(src.Bounds().Max.X), float32(src.Bounds().Max.Y)
+		cr, cg, cb, ca := op.ColorScale.R(), op.ColorScale.G(), op.ColorScale.B(), op.ColorScale.A()
+		vs := make([]ebiten.Vertex, 4)
+		for i, p := range [][2]float32{{0, 0}, {float32(w), 0}, {0, float32(h)}, {float32(w), float32(h)}} {
+			dx, dy := op.GeoM.Apply(float64(p[0]), float64(p[1]))
+			vs[i].DstX = float32(dx)
+			vs[i].DstY = float32(dy)
+			vs[i].ColorR = cr
+			vs[i].ColorG = cg
+			vs[i].ColorB = cb
+			vs[i].ColorA = ca
+		}
+		vs[0].SrcX, vs[0].SrcY = sx0, sy0
+		vs[1].SrcX, vs[1].SrcY = sx1, sy0
+		vs[2].SrcX, vs[2].SrcY = sx0, sy1
+		vs[3].SrcX, vs[3].SrcY = sx1, sy1
+		is := []uint16{0, 1, 2, 1, 2, 3}
+
+		opTriangles := &ebiten.DrawTrianglesShaderOptions{}
+		opTriangles.CompositeMode = ebiten.CompositeModeCustom
+		opTriangles.Blend = op.Blend
+		opTriangles.Uniforms = u.uniforms
+		opTriangles.Images[0] = src
+		opTriangles.Images[1] = img
+		s := builtinShader(colormshader.Filter(op.Filter), colormshader.AddressUnsafe, true)
+		dst.DrawTrianglesShader(vs, is, s, opTriangles)
+		return
+	}
 	u := acquireUniforms(colorM)
 	defer releaseUniforms(u)
 	opShader.Uniforms = u.uniforms
-	opShader.Images[0] = src
-	s := builtinShader(colormshader.Filter(op.Filter), colormshader.AddressUnsafe)
+	s := builtinShader(colormshader.Filter(op.Filter), colormshader.AddressUnsafe, false)
 	dst.DrawRectShader(src.Bounds().Dx(), src.Bounds().Dy(), s, opShader)
 }
 
@@ -111,6 +160,16 @@ type DrawTrianglesOptions struct {
 	//
 	// Deprecated: as of v2.9.
 	AntiAlias bool
+
+	// LUT is an optional lookup table used to apply the color transform.
+	//
+	// When LUT is non-nil, the colorM argument is ignored and the transform
+	// is applied through the LUT instead of an exact per-pixel matrix
+	// multiplication. This can be faster when the same transform is applied
+	// repeatedly, at the cost of a small quantization error.
+	//
+	// The default (zero) value is nil, which uses the exact matrix mode.
+	LUT *ColorTransformLUT
 }
 
 // DrawTriangles draws triangles onto dst.
@@ -145,10 +204,20 @@ func DrawTriangles(dst *ebiten.Image, vertices []ebiten.Vertex, indices []uint16
 	opShader.Blend = op.Blend
 	opShader.FillRule = op.FillRule
 	opShader.AntiAlias = op.AntiAlias
+	opShader.Images[0] = img
+	if op.LUT != nil {
+		snap, lutImg := op.LUT.drawState()
+		u := acquireLUTUniforms(snap)
+		defer releaseLUTUniforms(u)
+		opShader.Uniforms = u.uniforms
+		opShader.Images[1] = lutImg
+		s := builtinShader(colormshader.Filter(op.Filter), colormshader.Address(op.Address), true)
+		dst.DrawTrianglesShader(vertices, indices, s, opShader)
+		return
+	}
 	u := acquireUniforms(colorM)
 	defer releaseUniforms(u)
 	opShader.Uniforms = u.uniforms
-	opShader.Images[0] = img
-	s := builtinShader(colormshader.Filter(op.Filter), colormshader.Address(op.Address))
+	s := builtinShader(colormshader.Filter(op.Filter), colormshader.Address(op.Address), false)
 	dst.DrawTrianglesShader(vertices, indices, s, opShader)
 }

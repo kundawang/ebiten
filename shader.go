@@ -145,7 +145,7 @@ func builtinShader(filter builtinshader.Filter, address builtinshader.Address, u
 	} else {
 		var src []byte
 		if useColorM {
-			src = colormshader.ShaderSource(colormshader.Filter(filter), colormshader.Address(address))
+			src = colormshader.ShaderSource(colormshader.Filter(filter), colormshader.Address(address), false)
 		} else {
 			src = builtinshader.ShaderSource(filter, address)
 		}
