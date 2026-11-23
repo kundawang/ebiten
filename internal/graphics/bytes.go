@@ -34,6 +34,15 @@ func (m *ManagedBytes) Len() int {
 	return len(m.bytes)
 }
 
+// Bytes returns the underlying byte slice.
+//
+// The returned slice must not be retained after [ManagedBytes.Release] or
+// [ManagedBytes.GetAndRelease] is called, and must not be shared with another owner without
+// coordination.
+func (m *ManagedBytes) Bytes() []byte {
+	return m.bytes
+}
+
 // Read reads the byte slice's content into dst.
 func (m *ManagedBytes) Read(dst []byte, from, to int) {
 	copy(dst, m.bytes[from:to])

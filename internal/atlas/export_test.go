@@ -15,8 +15,12 @@
 package atlas
 
 import (
+	"image"
 	"weak"
 
+	"github.com/hajimehoshi/ebiten/v2/internal/graphics"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicscommand"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver"
 	"github.com/hajimehoshi/ebiten/v2/internal/shaderir"
 )
 
@@ -137,4 +141,117 @@ func (a *gpuResourcesState) RequestToRestoreGPUResources() bool {
 
 func (a *gpuResourcesState) StartRestoringGPUResourcesIfNeeded() bool {
 	return a.startRestoringGPUResourcesIfNeeded()
+}
+
+// SetResidencyFailureHooksForTesting makes the next n evictions and m re-uploads fail.
+func SetResidencyFailureHooksForTesting(evictionFailures, reloadFailures int) {
+	failNextEvictions = evictionFailures
+	failNextReloads = reloadFailures
+}
+
+// IsBackendResidentFuncForTesting reports whether the image's backend texture is currently on the GPU.
+func (i *Image) IsBackendResidentFuncForTesting() func() bool {
+	impl := i.imageImpl
+	return func() bool {
+		backendsM.Lock()
+		defer backendsM.Unlock()
+		return impl.backend != nil && impl.backend.backendImage != nil
+	}
+}
+
+// IsBackendEvictedFuncForTesting reports whether the image's backend keeps only CPU pixels.
+func (i *Image) IsBackendEvictedFuncForTesting() func() bool {
+	impl := i.imageImpl
+	return func() bool {
+		backendsM.Lock()
+		defer backendsM.Unlock()
+		return impl.backend != nil && impl.backend.evicted
+	}
+}
+
+func ResidencyStatsForTesting() ResidencyStats {
+	return ResidencyStatsSnapshot()
+}
+
+func SetBudgetForTesting(b TextureResidencyBudget) {
+	SetTextureResidencyBudget(b)
+}
+
+func DisableBudgetForTesting() {
+	DisableTextureResidencyBudget()
+}
+
+func ResetBudgetForTesting() {
+	ResetTextureResidencyBudgetForTesting()
+}
+
+func TrimForTesting(driver graphicsdriver.Graphics) error {
+	return TrimToBudgetForTesting(driver)
+}
+
+func LockResidencyForTesting() *ResidencyLock {
+	return LockResidency()
+}
+
+// SimulateDeviceRebuildForTesting mimics a context-loss rebuild:
+//   - resident backends are disposed after their pixels are saved into restoreInfo, then restored
+//     exactly as BeginFrame does after a device loss;
+//   - evicted backends keep only their CPU mirror and stay evicted, so a later draw re-uploads them.
+func SimulateDeviceRebuildForTesting(driver graphicsdriver.Graphics) {
+	backendsM.Lock()
+	defer backendsM.Unlock()
+
+	// Save phase, mirroring EndFrame's GPU-resource saving.
+	for _, b := range theBackends {
+		if b.backendImage == nil {
+			// Evicted: nothing on the GPU to save; the CPU mirror is the source of truth.
+			if b.evicted {
+				b.restoreInfo = restoreInfo{valid: true, screen: b.screen}
+			}
+			continue
+		}
+		var pixels *graphics.ManagedBytes
+		var region image.Rectangle
+		if !b.screen {
+			if b.page != nil {
+				region = b.page.AllocatedRegion()
+			} else {
+				region = image.Rect(0, 0, b.width, b.height)
+			}
+			if !region.Empty() {
+				var err error
+				pixels = graphics.NewManagedBytes(4*region.Dx()*region.Dy(), func(bs []byte) {
+					err = b.backendImage.ReadPixels(driver, []graphicsdriver.PixelsArgs{{Pixels: bs, Region: region}})
+				})
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+		b.restoreInfo = restoreInfo{valid: true, screen: b.screen, pixels: pixels, region: region}
+	}
+
+	// Dispose phase.
+	for _, b := range theBackends {
+		if b.backendImage == nil {
+			continue
+		}
+		b.backendImage.Dispose()
+		b.backendImage = nil
+	}
+
+	// Restore phase, mirroring BeginFrame after ResetGraphicsDriverState.
+	for _, b := range theBackends {
+		if b.evicted || !b.restoreInfo.valid {
+			continue
+		}
+		b.backendImage = graphicscommand.NewImage(b.width, b.height, b.restoreInfo.screen, "")
+		if b.restoreInfo.region != image.Rect(0, 0, b.width, b.height) {
+			b.clear(image.Rect(0, 0, b.width, b.height))
+		}
+		if b.restoreInfo.pixels != nil {
+			b.backendImage.WritePixels(b.restoreInfo.pixels, b.restoreInfo.region)
+		}
+		b.restoreInfo = restoreInfo{}
+	}
 }

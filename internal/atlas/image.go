@@ -15,6 +15,7 @@
 package atlas
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"math"
@@ -113,7 +114,11 @@ type backend struct {
 	width  int
 	height int
 
+	// id uniquely identifies a backend for deterministic residency ordering.
+	id uint64
+
 	// backendImage is an implementation backendImage stored in the GPU.
+	// backendImage is nil while the backend is evicted by the texture residency budget.
 	backendImage *graphicscommand.Image
 
 	// page is an atlas map. Each part is called a node.
@@ -137,6 +142,45 @@ type backend struct {
 
 	// restoreInfo is information for restoration from a context loss.
 	restoreInfo restoreInfo
+
+	// The following fields manage residency when a TextureResidencyBudget is active.
+	// All are accessed only while backendsM is held.
+
+	// evicted reports whether the GPU texture was disposed and the pixels live in residentPixels.
+	evicted bool
+
+	// residentPixels and residentRegion preserve the backend's pixels while it is evicted.
+	residentPixels *graphics.ManagedBytes
+	residentRegion image.Rectangle
+
+	// lastUsed is the access clock at the most recent use while resident.
+	lastUsed uint64
+
+	// residencyLocks counts active ResidencyLocks pinning this backend.
+	residencyLocks int
+
+	// evictionSequence and reloadSequence record the budget counters at the last state change.
+	evictionSequence uint64
+	reloadSequence   uint64
+
+	// residencyPriority is the keep-priority used by the budget eviction order. A higher value
+	// keeps the backend resident longer when recency is otherwise equal. It is the maximum priority
+	// requested by the images sharing this backend.
+	residencyPriority int
+}
+
+// nextBackendID hands out backend identifiers.
+var nextBackendID atomic.Uint64
+
+// disposeGPUTexture enqueues disposal of the backend's GPU texture and clears the context-loss
+// restore info. It is safe on both resident and evicted backends and never double-disposes.
+func (b *backend) disposeGPUTexture() {
+	if b.backendImage == nil {
+		return
+	}
+	b.backendImage.Dispose()
+	b.backendImage = nil
+	b.restoreInfo = restoreInfo{}
 }
 
 type restoreInfo struct {
@@ -148,6 +192,11 @@ type restoreInfo struct {
 
 func (b *backend) tryAlloc(width, height int) (*packing.Node, bool) {
 	if b.page == nil {
+		return nil, false
+	}
+	// An evicted backend has no GPU texture and must not receive new allocations until its images
+	// make it resident again, which happens through a different backend.
+	if b.evicted || b.backendImage == nil {
 		return nil, false
 	}
 	n := b.page.Alloc(width, height)
@@ -182,6 +231,9 @@ func (b *backend) tryAlloc(width, height int) (*packing.Node, bool) {
 
 func (b *backend) clear(region image.Rectangle) {
 	if b.backendImage == nil {
+		// While evicted, keep the CPU mirror consistent with the explicit clears performed on
+		// resident textures so a later re-upload reproduces the same pixels.
+		mirrorClear(b.residentPixels, b.residentRegion, region)
 		return
 	}
 	clearImage(b.backendImage, region)
@@ -270,6 +322,10 @@ type imageImpl struct {
 	//
 	// usedAsDestinationCount is not reset while the image is alive.
 	usedAsDestinationCount int
+
+	// residencyPriority is the image's requested keep-priority for budget eviction. The effective
+	// backend priority is the maximum over the images sharing it.
+	residencyPriority int
 }
 
 // moveTo moves its content to the given image dst.
@@ -420,6 +476,18 @@ func (i *imageImpl) regionWithPadding() image.Rectangle {
 	return i.node.Region().Intersect(image.Rect(0, 0, i.backend.width, i.backend.height))
 }
 
+// ensureResident makes the image's backend resident if it was evicted by the residency budget.
+// Failures are recorded on the budget and reported at EndFrame; the caller must check
+// i.backend.backendImage before using the texture.
+func (i *Image) ensureResident() {
+	if i.backend == nil || i.backend.backendImage != nil {
+		return
+	}
+	if err := theResidencyBudget.ensureResident(i.backend); err != nil {
+		theResidencyBudget.recordFrameError(err)
+	}
+}
+
 // DrawTriangles draws triangles with the given image.
 //
 // The vertex floats are:
@@ -475,11 +543,25 @@ func (i *Image) drawTriangles(srcs [graphics.ShaderSrcImageCount]*Image, vertice
 			// If the backend becomes the same as i's, i's backend will be changed at ensureIsolatedFromSource.
 			src.allocate(nil, src.imageType == ImageTypeRegular)
 		}
+		src.ensureResident()
+		if src.backend.backendImage == nil {
+			// Re-upload failed. Record the failure and skip this draw rather than enqueue a command
+			// referencing a disposed texture.
+			theResidencyBudget.recordFrameError(errBackendNotResident)
+			return
+		}
 		backends = append(backends, src.backend)
 		src.backend.sourceInThisFrame = true
+		theResidencyBudget.touch(src.backend)
 	}
 
 	i.ensureIsolatedFromSource(backends)
+	i.ensureResident()
+	if i.backend == nil || i.backend.backendImage == nil {
+		theResidencyBudget.recordFrameError(errBackendNotResident)
+		return
+	}
+	theResidencyBudget.touch(i.backend)
 
 	for _, src := range srcs {
 		// Compare i and source images after ensuring i is not on an atlas, or
@@ -571,6 +653,16 @@ func (i *Image) writePixels(pix []byte, region image.Rectangle) {
 		// Allocate as a source as this image will likely be used as a source.
 		i.allocate(nil, i.imageType == ImageTypeRegular)
 	}
+
+	// A budget eviction may have moved the backend's texture to CPU memory. Re-upload it before
+	// applying the new pixels so partial writes keep the preserved content around them.
+	i.ensureResident()
+	if i.backend.backendImage == nil {
+		// Re-upload failed: record the error and drop the write instead of touching a nil texture.
+		theResidencyBudget.recordFrameError(errBackendNotResident)
+		return
+	}
+	theResidencyBudget.touch(i.backend)
 
 	r := i.regionWithPadding()
 
@@ -670,6 +762,11 @@ func (i *Image) ReadPixelsAsync(pixels []byte, region image.Rectangle) *graphics
 // readPixelsAsync must be called in a frame with backendsM locked.
 func (i *Image) readPixelsAsync(pixels []byte, region image.Rectangle, result *graphicscommand.PixelReadback) {
 	if i.backend == nil || i.backend.backendImage == nil {
+		// While evicted, serve the read-back from the CPU mirror without forcing a re-upload.
+		if i.backend != nil && i.backend.evicted {
+			i.readPixelsFromResidencyMirror(pixels, region, result)
+			return
+		}
 		clear(pixels)
 		result.Complete(nil)
 		return
@@ -682,6 +779,36 @@ func (i *Image) readPixelsAsync(pixels []byte, region image.Rectangle, result *g
 		},
 	}
 	i.backend.backendImage.ReadPixelsAsync(args, result)
+}
+
+// readPixelsFromResidencyMirror copies requested pixels out of an evicted backend's CPU mirror.
+// The mirror covers the backend's allocated region; anything outside it is transparent.
+func (i *Image) readPixelsFromResidencyMirror(pixels []byte, region image.Rectangle, result *graphicscommand.PixelReadback) {
+	b := i.backend
+	clear(pixels)
+	if b.residentPixels == nil {
+		result.Complete(nil)
+		return
+	}
+
+	// region is given in the image's coordinates; translate it into backend coordinates.
+	full := region.Add(i.regionWithPadding().Min)
+	inter := full.Intersect(b.residentRegion)
+	if inter.Empty() {
+		result.Complete(nil)
+		return
+	}
+
+	mirror := b.residentPixels.Bytes()
+	mirrorW := b.residentRegion.Dx()
+	for y := inter.Min.Y; y < inter.Max.Y; y++ {
+		for x := inter.Min.X; x < inter.Max.X; x++ {
+			mIdx := 4 * ((y-b.residentRegion.Min.Y)*mirrorW + (x - b.residentRegion.Min.X))
+			dIdx := 4 * ((y-full.Min.Y)*full.Dx() + (x - full.Min.X))
+			copy(pixels[dIdx:dIdx+4], mirror[mIdx:mIdx+4])
+		}
+	}
+	result.Complete(nil)
 }
 
 // Deallocate deallocates the internal state.
@@ -717,22 +844,28 @@ func (i *imageImpl) deallocateImpl() {
 		return
 	}
 
+	b := i.backend
 	if i.isOnAtlas() {
-		i.backend.page.Free(i.node)
-		if !i.backend.page.IsEmpty() {
+		b.page.Free(i.node)
+		if !b.page.IsEmpty() {
 			// As this part can be reused, this should be cleared explicitly.
 			r := i.regionWithPadding()
-			i.backend.clear(r)
+			b.clear(r)
 			return
 		}
 	}
 
-	i.backend.backendImage.Dispose()
-	i.backend.backendImage = nil
-	i.backend.restoreInfo = restoreInfo{}
+	// The page is empty or the backend is isolated: release the whole backend.
+	b.disposeGPUTexture()
+	if b.residentPixels != nil {
+		b.residentPixels.Release()
+		b.residentPixels = nil
+		b.residentRegion = image.Rectangle{}
+	}
+	b.evicted = false
 
 	for idx, sh := range theBackends {
-		if sh == i.backend {
+		if sh == b {
 			copy(theBackends[idx:], theBackends[idx+1:])
 			theBackends[len(theBackends)-1] = nil
 			theBackends = theBackends[:len(theBackends)-1]
@@ -794,6 +927,7 @@ func (i *Image) allocate(forbiddenBackends []*backend, asSource bool) {
 		}
 		// A screen image doesn't have a padding.
 		i.backend = &backend{
+			id:           nextBackendID.Add(1),
 			width:        i.width,
 			height:       i.height,
 			backendImage: graphicscommand.NewImage(i.width, i.height, true, ""),
@@ -801,6 +935,8 @@ func (i *Image) allocate(forbiddenBackends []*backend, asSource bool) {
 		}
 		i.backend.clear(image.Rect(0, 0, i.width, i.height))
 		theBackends = append(theBackends, i.backend)
+		theResidencyBudget.applyPriorityToBackend(i.imageImpl)
+		theResidencyBudget.recordPeak()
 		return
 	}
 
@@ -813,6 +949,7 @@ func (i *Image) allocate(forbiddenBackends []*backend, asSource bool) {
 		}
 
 		i.backend = &backend{
+			id:           nextBackendID.Add(1),
 			width:        wp,
 			height:       hp,
 			backendImage: graphicscommand.NewImage(wp, hp, false, ""),
@@ -820,6 +957,8 @@ func (i *Image) allocate(forbiddenBackends []*backend, asSource bool) {
 		}
 		i.backend.clear(image.Rect(0, 0, wp, hp))
 		theBackends = append(theBackends, i.backend)
+		theResidencyBudget.applyPriorityToBackend(i.imageImpl)
+		theResidencyBudget.recordPeak()
 		return
 	}
 
@@ -838,6 +977,7 @@ loop:
 		if n, ok := b.tryAlloc(wp, hp); ok {
 			i.backend = b
 			i.node = n
+			theResidencyBudget.applyPriorityToBackend(i.imageImpl)
 			return
 		}
 	}
@@ -865,6 +1005,7 @@ loop:
 	// Only a regular image can be put on an atlas, so every image on this page has the same padding.
 	page := packing.NewPage(width, height, maxPage, i.paddingSize())
 	b := &backend{
+		id:           nextBackendID.Add(1),
 		width:        width,
 		height:       height,
 		backendImage: graphicscommand.NewImage(width, height, false, ""),
@@ -880,6 +1021,8 @@ loop:
 	}
 	i.backend = b
 	i.node = n
+	theResidencyBudget.applyPriorityToBackend(i.imageImpl)
+	theResidencyBudget.recordPeak()
 }
 
 func (i *Image) DumpScreenshot(graphicsDriver graphicsdriver.Graphics, path string, blackbg bool) (string, error) {
@@ -888,6 +1031,11 @@ func (i *Image) DumpScreenshot(graphicsDriver graphicsdriver.Graphics, path stri
 
 	if !inFrame {
 		panic("atlas: DumpScreenshot must be called in between BeginFrame and EndFrame")
+	}
+
+	i.ensureResident()
+	if i.backend == nil || i.backend.backendImage == nil {
+		return "", errBackendNotResident
 	}
 
 	return i.backend.backendImage.Dump(graphicsDriver, path, blackbg, image.Rect(0, 0, i.width, i.height))
@@ -963,10 +1111,31 @@ func EndFrame(graphicsDriver graphicsdriver.Graphics) error {
 		b.sourceInThisFrame = false
 	}
 
+	// Apply residency trims while the graphics driver is available. A residency failure observed
+	// during the frame is reported before the trim so callers see both kinds of errors.
+	if err := theResidencyBudget.consumeFrameError(); err != nil {
+		// Still attempt the trim, but prefer the earlier error.
+		if trimErr := theResidencyBudget.processFrameBoundaryTasks(graphicsDriver); trimErr != nil {
+			return errors.Join(err, trimErr)
+		}
+		return err
+	}
+	if err := theResidencyBudget.processFrameBoundaryTasks(graphicsDriver); err != nil {
+		return err
+	}
+
 	if theGPUResourcesState.isSavingGPUResourcesRequested() {
 		flushDeferred()
 		for _, b := range theBackends {
 			if b.backendImage == nil {
+				// Evicted backends have no GPU texture to save. Their CPU mirror is enough to
+				// re-upload after the device is rebuilt.
+				if b.evicted {
+					b.restoreInfo = restoreInfo{
+						valid:  true,
+						screen: b.screen,
+					}
+				}
 				continue
 			}
 			var pixels *graphics.ManagedBytes
@@ -1095,12 +1264,21 @@ func BeginFrame(graphicsDriver graphicsdriver.Graphics) error {
 		// Dispose all the images.
 		// The current internal image objects might have references to old GPU resources.
 		for _, b := range theBackends {
+			if b.backendImage == nil {
+				continue
+			}
 			b.backendImage.Dispose()
 			b.backendImage = nil
 		}
 
 		// Restore all the images.
 		for _, b := range theBackends {
+			// Evicted backends keep their pixels in CPU memory and must not be re-created here:
+			// a later ensureResident re-uploads them on demand.
+			if b.evicted {
+				b.restoreInfo = restoreInfo{}
+				continue
+			}
 			if !b.restoreInfo.valid {
 				continue
 			}
