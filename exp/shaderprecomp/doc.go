@@ -81,6 +81,29 @@
 // is not stable across Ebitengine versions; use the application's Ebitengine version for collection
 // and precompilation.
 //
+// # Precompilation manifests
+//
+// For large projects, registering shaders one at a time does not give an auditable, cross-platform view
+// of which backends are actually covered. A [Manifest] is a versioned inventory that records, for every
+// shader source, its [ShaderSourceID], a hash of the source, its macros and uniform layout, and every
+// generated backend artifact together with its own hash. It is designed to be checked in and re-verified
+// in CI so a missing file, a corrupted artifact, a changed source or an only-partially-covered backend
+// fails the build with the offending entry named, instead of being silently treated as covered.
+//
+// [Generate] compiles a set of sources for the pure-Go text backends (GLSL, GLSL ES, HLSL and MSL),
+// writes their artifacts under a root directory and returns a canonical [Manifest]. Binary backends
+// (DXBC, Metal libraries, PlayStation shaders) are produced by their platform toolchains and attached
+// afterwards via the manifest's AddArtifact method; the manifest verifies them in exactly the same way.
+// [Validate] re-checks every source ID, hash, uniform layout and artifact (decompressing gzip files
+// first), and [Diff] reports the changes between two manifests. The internal
+// github.com/hajimehoshi/ebiten/v2/internal/shaderprecompmanifest command wraps these operations with
+// stable CI exit codes: 0 for success (or identical diffs), 1 for a manifest error, 2 for a usage error,
+// and 3 when two well-formed manifests differ.
+//
+// A manifest is serialized canonically: entries, artifacts, uniforms and macros are sorted, paths use
+// forward slashes, and the JSON is tab-indented with LF line endings, so regenerating an unchanged
+// manifest produces byte-identical output.
+//
 // # Example
 //
 // The [shaderprecomp example] includes a generator and registration code using go:embed.
