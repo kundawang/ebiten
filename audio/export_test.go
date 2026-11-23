@@ -394,3 +394,40 @@ func (i *InfiniteLoop) SetNoBlendForTesting(value bool) {
 func NewTimeStreamForTesting(src io.ReadSeeker, sampleRate int) (io.ReadSeeker, error) {
 	return newTimeStream(src, true, sampleRate, bitDepthInBytesInt16)
 }
+
+// NewOfflineAudioVoiceMixerForTesting creates a mixer without a bus Player. Tests drive the mixer
+// directly through Read, so voice state advances in fixed, deterministic pulses with no device.
+func NewOfflineAudioVoiceMixerForTesting(maxVoices int) *AudioVoiceMixer {
+	c := CurrentContext()
+	return c.newAudioVoiceMixer(maxVoices, false)
+}
+
+// NewAudioVoiceMixerForTestingWithBus creates a mixer whose bus Player exists, so that a device
+// rebuild (RebuildForTesting) can be exercised. The mixer itself is still driven through Read in
+// tests rather than through the device.
+func NewAudioVoiceMixerForTestingWithBus() *AudioVoiceMixer {
+	c := CurrentContext()
+	return c.newAudioVoiceMixer(8, true)
+}
+
+// NewOfflineAudioVoiceMixerWithSampleRateForTesting creates an offline mixer with an explicit
+// sample rate, so a test can exercise sample-rate conversion without creating a second context.
+func NewOfflineAudioVoiceMixerWithSampleRateForTesting(sampleRate, maxVoices int) *AudioVoiceMixer {
+	c := &Context{
+		sampleRate:    sampleRate,
+		playerFactory: newPlayerFactory(sampleRate),
+	}
+	return c.newAudioVoiceMixer(maxVoices, false)
+}
+
+// FramePositionForTesting reports the mixer's deterministic frame clock.
+func (m *AudioVoiceMixer) FramePositionForTesting() uint64 {
+	m.impl.m.Lock()
+	defer m.impl.m.Unlock()
+	return m.impl.framePos
+}
+
+// RebuildForTesting closes and recreates the bus Player, simulating an audio device rebuild.
+func (m *AudioVoiceMixer) RebuildForTesting() error {
+	return m.rebuild()
+}
