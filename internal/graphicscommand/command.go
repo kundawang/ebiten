@@ -337,7 +337,9 @@ func TerminateGraphicsDriverState(graphicsDriver graphicsdriver.Graphics) error 
 // If the graphics driver doesn't have an API to reset, ResetGraphicsDriverState does nothing.
 func ResetGraphicsDriverState(graphicsDriver graphicsdriver.Graphics) error {
 	if r, ok := graphicsDriver.(graphicsdriver.Resetter); ok {
-		return runOnRenderThread(graphicsdriver.Resetter.Reset, r)
+		err := runOnRenderThread(graphicsdriver.Resetter.Reset, r)
+		theTrace.recordReset(err)
+		return err
 	}
 	return nil
 }

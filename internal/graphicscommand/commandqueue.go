@@ -297,8 +297,10 @@ func (q *commandQueue) flush(graphicsDriver graphicsdriver.Graphics, mode graphi
 		if begun {
 			// Call End even if an error occurs, or the graphics driver's state might be stale (#2388).
 			if graphicsErr := graphicsDriver.End(mode); graphicsErr != nil {
+				theTrace.recordError("end", graphicsErr)
 				err = errors.Join(err, graphicsErr)
 			}
+			theTrace.endBatch(mode)
 		}
 		if err != nil {
 			q.abortQueuedReadPixels(err)
@@ -331,7 +333,10 @@ func (q *commandQueue) flush(graphicsDriver graphicsdriver.Graphics, mode graphi
 		}
 	}()
 
+	theTrace.beginBatch(mode)
 	if err := graphicsDriver.Begin(); err != nil {
+		theTrace.recordError("begin", err)
+		theTrace.endBatch(mode)
 		return err
 	}
 	begun = true
@@ -353,6 +358,7 @@ func (q *commandQueue) flush(graphicsDriver graphicsdriver.Graphics, mode graphi
 		}
 		if 0 < ne {
 			if err := graphicsDriver.SetVertices(vs[:nv], es[:ne]); err != nil {
+				theTrace.recordError("set-vertices", err)
 				return err
 			}
 			es = es[ne:]
@@ -360,7 +366,9 @@ func (q *commandQueue) flush(graphicsDriver graphicsdriver.Graphics, mode graphi
 		}
 		var indexOffset int
 		for _, c := range cs[:nc] {
+			kind := theTrace.recordCommand(c)
 			if err := c.Exec(q, graphicsDriver, indexOffset); err != nil {
+				theTrace.recordCommandError(kind, err)
 				return err
 			}
 			if debug.IsDebug {
