@@ -227,6 +227,7 @@ func (g *GoTextFace) appendLazyGlyphsForLine(glyphs []LazyGlyph, line string, in
 				OriginOffsetY:     fixed26_6ToFloat64(-glyph.shapingGlyph.YOffset),
 				AdvanceX:          advanceX,
 				AdvanceY:          advanceY,
+				rtl:               glyph.rtl,
 			}
 			if hasImage {
 				if imager == nil {

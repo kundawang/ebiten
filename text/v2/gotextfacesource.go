@@ -58,6 +58,10 @@ type goTextGlyph struct {
 	startIndex   int
 	endIndex     int
 
+	// rtl reports whether the glyph was shaped in a right-to-left run.
+	// It is always false for vertical text.
+	rtl bool
+
 	// render is a pointer to the shared render data (bounds plus the
 	// lazily-realized segments and bitmap). It is nil for glyphs with
 	// no outline and no bitmap (e.g. control characters).
@@ -968,6 +972,7 @@ func (g *GoTextFaceSource) buildGlyphs(outputs []shaping.Output, text string, fa
 	var gs []goTextGlyph
 	for _, out := range outputs {
 		sideways := out.Direction.IsSideways()
+		runRTL := !out.Direction.IsVertical() && out.Direction.Progression() == di.TowardTopLeft
 		for _, gl := range out.Glyphs {
 			if g.renderDataCache == nil {
 				g.renderDataCache = newCache[glyphRenderDataCacheKey, *glyphRenderData](512)
@@ -987,6 +992,7 @@ func (g *GoTextFaceSource) buildGlyphs(outputs []shaping.Output, text string, fa
 				shapingGlyph: &gl,
 				startIndex:   indices[gl.TextIndex()],
 				endIndex:     indices[gl.TextIndex()+gl.RunesCount()],
+				rtl:          runRTL,
 				render:       render,
 			})
 		}

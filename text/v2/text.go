@@ -285,6 +285,12 @@ type LazyGlyph struct {
 
 	// imageIndex is this glyph's index within imager's args slice.
 	imageIndex int
+
+	// rtl reports whether this glyph was shaped in a right-to-left run.
+	// It is always false for vertical text. It is unexported because it
+	// only serves layout bookkeeping within this package (e.g. caret
+	// mapping); callers should not depend on it.
+	rtl bool
 }
 
 // Image returns the rasterized glyph bitmap.
