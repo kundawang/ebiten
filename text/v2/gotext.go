@@ -457,6 +457,12 @@ func (g *GoTextFace) direction() Direction {
 	return g.Direction
 }
 
+// languageTag implements languageFace, exposing the face's BCP 47 language
+// hint for language-aware fallback selection.
+func (g *GoTextFace) languageTag() language.Tag {
+	return g.Language
+}
+
 // private implements Face.
 func (g *GoTextFace) private() {
 }
