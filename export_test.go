@@ -14,11 +14,36 @@
 
 package ebiten
 
-import "github.com/hajimehoshi/ebiten/v2/internal/builtinshader"
+import (
+	"os"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/builtinshader"
+)
 
 var (
 	ImageToBytes = imageToBytes
 )
+
+// NewImageDumpStreamForTesting creates an ImageDumpStream with an injected
+// writer factory so tests can simulate short writes, write errors and panics.
+// The factory receives the already-open temp file and returns the writer used
+// for the frame or manifest bytes.
+func NewImageDumpStreamForTesting(options ImageDumpStreamOptions, factory func(f *os.File) WriteCloserForTesting) (*ImageDumpStream, error) {
+	return newImageDumpStream(options, func(f *os.File) writeCloser {
+		return factory(f)
+	})
+}
+
+// WriteCloserForTesting is the writer interface tests must implement.
+type WriteCloserForTesting interface {
+	Write(p []byte) (int, error)
+	Close() error
+}
+
+// ImageDumpStreamDirForTesting exposes the resolved output directory.
+func (s *ImageDumpStream) ImageDumpStreamDirForTesting() string {
+	return s.dir
+}
 
 func SetPanicOnErrorOnReadingPixelsForTesting(value bool) {
 	panicOnErrorOnReadingPixels = value
