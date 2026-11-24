@@ -70,6 +70,11 @@ type Context struct {
 	err        error
 	ready      bool
 
+	// route is the lazy audio device route. It is nil until AudioDeviceRoute is first called, so a
+	// context which never routes audio keeps its original behavior.
+	route     *AudioDeviceRoute
+	routeOnce sync.Once
+
 	playingPlayers map[*playerImpl]struct{}
 
 	m sync.Mutex
@@ -236,6 +241,9 @@ func (c *Context) waitForPlayingPlayers() bool {
 // close makes the goroutine updating the players exit, and waits for it to exit.
 func (c *Context) close() {
 	c.markClosed()
+	if c.route != nil {
+		_ = c.route.router.close()
+	}
 	c.updater.Wait()
 }
 
@@ -376,6 +384,20 @@ func (c *Context) IsReady() bool {
 // SampleRate returns the sample rate.
 func (c *Context) SampleRate() int {
 	return c.sampleRate
+}
+
+// AudioDeviceRoute returns the context's audio device route.
+//
+// The route is created lazily on the first call. Until then the context plays through the single
+// device it opened at startup, exactly as it did before routing existed. Once obtained, the route
+// can enumerate devices, switch between them with fade-out and fade-in, and react to hot-plug
+// changes. Players keep their position, loop state and volume across every switch.
+func (c *Context) AudioDeviceRoute() *AudioDeviceRoute {
+	c.routeOnce.Do(func() {
+		router := c.playerFactory.ensureRouter()
+		c.route = &AudioDeviceRoute{router: router}
+	})
+	return c.route
 }
 
 // Player is an audio player which has one stream.

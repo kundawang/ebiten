@@ -56,6 +56,14 @@ type playerFactory struct {
 	// package). It is set when the driver is created.
 	vmGuest bool
 
+	// router is the device route, created lazily when routing is first used. Once non-nil it owns
+	// the driver above, and new players are created through it so device switches can move them.
+	router *deviceRouter
+
+	// nextRouteSeq assigns a stable ordering number to every player, used for deterministic
+	// migration order during a device switch.
+	nextRouteSeq uint64
+
 	m sync.Mutex
 }
 
@@ -77,6 +85,17 @@ type playerImpl struct {
 	factory        *playerFactory
 	initBufferSize int
 	bytesPerSample int
+
+	// gain is the per-player fade stage. It exists once the player takes part in device routing
+	// and wraps the time stream; the device player reads through it and the routed stream.
+	gain *gainStream
+
+	// routed is the wrapper around the current device player while routing owns the device.
+	// When non-nil, player holds the same underlying player through this wrapper.
+	routed *routedPlayer
+
+	// routeSeq orders players deterministically during a device switch.
+	routeSeq uint64
 
 	// volume is the player's volume in the range of [0, math.MaxFloat32].
 	// The value is kept here so that a volume set before the underlying player is created is preserved.
@@ -107,6 +126,7 @@ func (f *playerFactory) newPlayer(context *Context, src io.Reader, seekable bool
 	f.m.Lock()
 	defer f.m.Unlock()
 
+	f.nextRouteSeq++
 	p := &playerImpl{
 		src:            src,
 		seekable:       seekable,
@@ -116,6 +136,7 @@ func (f *playerFactory) newPlayer(context *Context, src io.Reader, seekable bool
 		lastSamples:    -1,
 		bytesPerSample: bitDepthInBytes * channelCount,
 		volume:         1,
+		routeSeq:       f.nextRouteSeq,
 	}
 	// AddCleanup is not set for p. The caller of newPlayer should set a finalizer for p's wrapper.
 	return p, nil
@@ -123,32 +144,47 @@ func (f *playerFactory) newPlayer(context *Context, src io.Reader, seekable bool
 
 func (f *playerFactory) suspend() error {
 	f.m.Lock()
-	defer f.m.Unlock()
+	router := f.router
+	driver := f.driver
+	f.m.Unlock()
 
-	if f.driver == nil {
+	if router != nil {
+		return addErrorInfo(router.routeSuspend())
+	}
+	if driver == nil {
 		return nil
 	}
-	return addErrorInfo(f.driver.Suspend())
+	return addErrorInfo(driver.Suspend())
 }
 
 func (f *playerFactory) resume() error {
 	f.m.Lock()
-	defer f.m.Unlock()
+	router := f.router
+	driver := f.driver
+	f.m.Unlock()
 
-	if f.driver == nil {
+	if router != nil {
+		return addErrorInfo(router.routeResume())
+	}
+	if driver == nil {
 		return nil
 	}
-	return addErrorInfo(f.driver.Resume())
+	return addErrorInfo(driver.Resume())
 }
 
 func (f *playerFactory) error() error {
 	f.m.Lock()
-	defer f.m.Unlock()
+	router := f.router
+	driver := f.driver
+	f.m.Unlock()
 
-	if f.driver == nil {
+	if router != nil {
+		return addErrorInfo(router.routeError())
+	}
+	if driver == nil {
 		return nil
 	}
-	return addErrorInfo(f.driver.Err())
+	return addErrorInfo(driver.Err())
 }
 
 func (f *playerFactory) initDriverIfNeeded(vmGuest bool) (<-chan struct{}, error) {
@@ -214,6 +250,15 @@ func (p *playerImpl) ensurePlayer() error {
 		return nil
 	}
 
+	// Routing owns the device once it has been enabled. New players attach to the active device
+	// through the router, which wraps their stream with the fade and resampling chain.
+	if router := p.factory.router; router != nil {
+		if err := router.attachPlayer(p); err != nil {
+			return err
+		}
+		return nil
+	}
+
 	d := p.factory.currentDriver()
 	if d == nil {
 		return nil
@@ -250,6 +295,8 @@ func (p *playerImpl) startIfPending() error {
 		// Play and the first before-update hook (which creates the device); keep the play pending.
 		return nil
 	}
+	// A routed player detached while no device was available keeps its play pending until a
+	// device is open again. ensurePlayer reattaches it, so start it now.
 	if !p.player.IsPlaying() {
 		p.playAndStartStopwatch()
 	}
@@ -325,6 +372,9 @@ func (p *playerImpl) Pause() {
 		return
 	}
 
+	if p.gain != nil {
+		p.gain.abortFade()
+	}
 	p.player.Pause()
 	p.context.removePlayingPlayer(p)
 	p.stopwatch.stop()
@@ -349,6 +399,9 @@ func (p *playerImpl) PauseAndStopReading() {
 		return
 	}
 
+	if p.gain != nil {
+		p.gain.abortFade()
+	}
 	// The underlying player keeps reading the source even while paused, so it must be told to stop
 	// regardless of the playing state.
 	p.player.PauseAndStopReading()
@@ -425,9 +478,17 @@ func (p *playerImpl) Close() error {
 
 	p.context.removePlayingPlayer(p)
 
+	if p.gain != nil {
+		p.gain.abortFade()
+	}
+	if r := p.factory.router; r != nil {
+		r.onPlayerClosed(p)
+	}
+
 	if p.player != nil {
 		defer func() {
 			p.player = nil
+			p.routed = nil
 		}()
 		p.player.PauseAndStopReading()
 		// Release the device player if it holds resources beyond this process (the

@@ -432,6 +432,22 @@ func (r *Resampling) Read(b []byte) (int, error) {
 	return n, nil
 }
 
+// BufferedSourceFrames returns the number of whole source frames the resampler has pulled from
+// its source but has not emitted yet. It counts frames in the source's rate, including frames held
+// in the interpolation window. A returned position past the source end contributes nothing.
+func (r *Resampling) BufferedSourceFrames() int64 {
+	size := int64(r.bytesPerSample())
+	srcConsumed := r.srcReadEnd / size
+	outFrames := r.pos / size
+	// The interpolation window reads up to windowSize source frames ahead of the output position.
+	// Clamp at the consumed position so a stream near its end does not report frames it never read.
+	buffered := srcConsumed - outFrames*int64(r.from)/int64(r.to)
+	if buffered < 0 {
+		return 0
+	}
+	return buffered
+}
+
 // Seek sets the stream position and returns an error wrapping [errors.ErrUnsupported] if the source is not an [io.Seeker]
 // or whence is [io.SeekEnd] and the length is unknown.
 func (r *Resampling) Seek(offset int64, whence int) (int64, error) {
