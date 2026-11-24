@@ -27,16 +27,18 @@ import (
 
 var _ io.ReadSeeker = (*float32BytesReadSeeker)(nil)
 
-func newFloat32BytesReadSeeker(r *oggvorbis.Reader, seekable bool) *float32BytesReadSeeker {
+func newFloat32BytesReadSeeker(r *oggvorbis.Reader, seekable bool, indexer *seekIndexer) *float32BytesReadSeeker {
 	return &float32BytesReadSeeker{
 		r:        r,
 		seekable: seekable,
+		indexer:  indexer,
 	}
 }
 
 type float32BytesReadSeeker struct {
 	r        *oggvorbis.Reader
 	seekable bool
+	indexer  *seekIndexer
 	fbuf     []float32
 	pos      int64
 	eof      bool
@@ -129,8 +131,14 @@ func (r *float32BytesReadSeeker) Seek(offset int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("vorbis: invalid seek position")
 	}
 	pos := offset / sampleSize * sampleSize
-	if err := r.r.SetPosition(pos / sampleSize); err != nil {
-		return 0, err
+	if r.indexer != nil {
+		if err := r.indexer.seekToSample(r.r, pos/sampleSize); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := r.r.SetPosition(pos / sampleSize); err != nil {
+			return 0, err
+		}
 	}
 	r.pos = pos
 	r.fbuf = r.fbuf[:0]

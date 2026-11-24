@@ -37,6 +37,7 @@ type Stream struct {
 	readSeeker io.ReadSeeker
 	length     int64
 	sampleRate int
+	indexer    *seekIndexer
 }
 
 // Read is an implementation of io.Reader's Read.
@@ -71,6 +72,26 @@ func (s *Stream) SampleRate() int {
 	return s.sampleRate
 }
 
+// SetVorbisSeekIndex attaches an index that [Stream.Seek] uses to jump directly
+// to the Ogg page nearest to the target instead of scanning the stream from
+// its beginning.
+//
+// The index must have been built from the same bytes as the stream's source.
+// Attaching an index built from different data is harmless: every mismatching
+// entry is detected on the first seek that uses it, discarded and retried with
+// the ordinary linear fallback.
+//
+// Attaching nil removes the current index. When the stream's source is not an
+// [io.Seeker], SetVorbisSeekIndex returns an error wrapping [errors.ErrUnsupported]
+// and Seek remains unavailable.
+func (s *Stream) SetVorbisSeekIndex(index *VorbisSeekIndex) error {
+	if s.indexer == nil {
+		return fmt.Errorf("vorbis: the stream's source is not seekable: %w", errors.ErrUnsupported)
+	}
+	s.indexer.attach(index)
+	return nil
+}
+
 // DecodeF32 decodes Ogg/Vorbis data to playable stream in 32bit float, little endian, 2 channels (stereo) format.
 //
 // DecodeF32 returns error when decoding fails or IO error happens.
@@ -80,6 +101,14 @@ func (s *Stream) SampleRate() int {
 // A Stream doesn't close src even if src implements io.Closer.
 // Closing the source is src owner's responsibility.
 func DecodeF32(src io.Reader) (*Stream, error) {
+	readSeeker, seekable := src.(io.ReadSeeker)
+	var indexer *seekIndexer
+	if seekable {
+		indexer = &seekIndexer{
+			source: &indexedSource{source: readSeeker},
+		}
+		src = indexer.source
+	}
 	r, err := oggvorbis.NewReader(src)
 	if err != nil {
 		return nil, err
@@ -88,8 +117,7 @@ func DecodeF32(src io.Reader) (*Stream, error) {
 		return nil, fmt.Errorf("vorbis: number of channels must be 1 or 2 but was %d", r.Channels())
 	}
 
-	_, seekable := src.(io.Seeker)
-	var s io.ReadSeeker = newFloat32BytesReadSeeker(r, seekable)
+	var s io.ReadSeeker = newFloat32BytesReadSeeker(r, seekable, indexer)
 	length := r.Length() * int64(r.Channels()) * bitDepthInBytesFloat32
 	if r.Channels() == 1 {
 		s = convert.NewStereoF32(s, true)
@@ -100,6 +128,7 @@ func DecodeF32(src io.Reader) (*Stream, error) {
 		readSeeker: s,
 		length:     length,
 		sampleRate: r.SampleRate(),
+		indexer:    indexer,
 	}
 	// Read some data for performance (#297).
 	if seekable && r.Length() > 0 {
@@ -117,6 +146,7 @@ type i16Stream struct {
 	posInBytes   int64
 	seekable     bool
 	vorbisReader *oggvorbis.Reader
+	indexer      *seekIndexer
 	i16Reader    io.Reader
 }
 
@@ -164,8 +194,14 @@ func (s *i16Stream) Seek(offset int64, whence int) (int64, error) {
 	}
 	sampleSize := int64(s.vorbisReader.Channels()) * bitDepthInBytesInt16
 	pos := next / sampleSize * sampleSize
-	if err := s.vorbisReader.SetPosition(pos / sampleSize); err != nil {
-		return 0, err
+	if s.indexer != nil {
+		if err := s.indexer.seekToSample(s.vorbisReader, pos/sampleSize); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := s.vorbisReader.SetPosition(pos / sampleSize); err != nil {
+			return 0, err
+		}
 	}
 	s.posInBytes = pos
 	s.i16Reader = nil
@@ -181,6 +217,14 @@ func (s *i16Stream) totalBytes() int64 {
 
 // decodeI16 accepts an ogg stream and returns a decoded stream.
 func decodeI16(in io.Reader) (*i16Stream, error) {
+	readSeeker, seekable := in.(io.ReadSeeker)
+	var indexer *seekIndexer
+	if seekable {
+		indexer = &seekIndexer{
+			source: &indexedSource{source: readSeeker},
+		}
+		in = indexer.source
+	}
 	r, err := oggvorbis.NewReader(in)
 	if err != nil {
 		return nil, err
@@ -189,11 +233,11 @@ func decodeI16(in io.Reader) (*i16Stream, error) {
 		return nil, fmt.Errorf("vorbis: number of channels must be 1 or 2 but was %d", r.Channels())
 	}
 
-	_, seekable := in.(io.Seeker)
 	s := &i16Stream{
 		seekable:     seekable,
 		posInBytes:   0,
 		vorbisReader: r,
+		indexer:      indexer,
 	}
 	// Read some data for performance (#297).
 	if seekable && r.Length() > 0 {
@@ -232,6 +276,7 @@ func DecodeWithoutResampling(src io.Reader) (*Stream, error) {
 		readSeeker: s,
 		length:     length,
 		sampleRate: i16Stream.vorbisReader.SampleRate(),
+		indexer:    i16Stream.indexer,
 	}
 	return stream, nil
 }
@@ -284,6 +329,7 @@ func DecodeWithSampleRate(sampleRate int, src io.Reader) (*Stream, error) {
 		readSeeker: s,
 		length:     length,
 		sampleRate: sampleRate,
+		indexer:    i16Stream.indexer,
 	}
 	return stream, nil
 }
