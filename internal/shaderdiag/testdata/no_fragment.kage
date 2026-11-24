@@ -1,0 +1,7 @@
+//kage:unit pixels
+
+package main
+
+func notFragment() vec4 {
+	return vec4(1)
+}

@@ -1,0 +1,15 @@
+//kage:unit pixels
+
+package main
+
+//line common/util.kage:10
+func helper() vec4 {
+//line common/inner.kage:20
+	return vec4(unknownVar)
+//line common/util.kage:13
+}
+
+//line include.kage:12
+func Fragment(dstPos vec4, src0Pos vec2, color vec4) vec4 {
+	return helper()
+}

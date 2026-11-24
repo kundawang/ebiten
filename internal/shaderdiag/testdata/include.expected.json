@@ -1,0 +1,20 @@
+{
+  "errors": [
+    {
+      "code": "KAGE2001",
+      "stage": "typecheck",
+      "message": "unexpected identifier: unknownVar",
+      "file": "common/inner.kage",
+      "line": 20,
+      "callStack": [
+        {
+          "function": "helper",
+          "file": "common/util.kage",
+          "line": 10
+        }
+      ],
+      "macroContext": "//kage:unit pixels"
+    }
+  ],
+  "truncated": 0
+}

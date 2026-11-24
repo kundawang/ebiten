@@ -68,11 +68,17 @@ type compileState struct {
 	global block
 
 	errs []compileError
+
+	// currentFunc is the name of the function being parsed, or "" at the package level.
+	currentFunc    string
+	currentFuncPos token.Pos
 }
 
 type compileError struct {
 	position token.Position
 	message  string
+	function string
+	funcPos  token.Position
 }
 
 func (cs *compileState) findFunction(name string) (int, bool) {
@@ -217,6 +223,38 @@ func (p *ParseError) Positions() []token.Position {
 	return ps
 }
 
+// CompileError is a single structured error reported by [Compile].
+type CompileError struct {
+	// Position is the source position of the error.
+	Position token.Position
+
+	// Message is the error message.
+	Message string
+
+	// Function is the name of the function being compiled when the error was reported, or "" at the
+	// package level.
+	Function string
+
+	// FunctionPosition is the position of the declaration of Function. It is the zero value when
+	// Function is "".
+	FunctionPosition token.Position
+}
+
+// CompileErrors returns the errors as structured values, in the same order as [ParseError.Error]
+// reports them. The result is a copy; modifying it does not affect the original error.
+func (p *ParseError) CompileErrors() []CompileError {
+	es := make([]CompileError, 0, len(p.errs))
+	for _, e := range p.errs {
+		es = append(es, CompileError{
+			Position:         e.position,
+			Message:          e.message,
+			Function:         e.function,
+			FunctionPosition: e.funcPos,
+		})
+	}
+	return es
+}
+
 const internalRegionDirective = "//kage:internalregion"
 
 const (
@@ -265,9 +303,15 @@ func Compile(src []byte, vertexEntry, fragmentEntry string, textureCount int) (*
 }
 
 func (s *compileState) addError(pos token.Pos, str string) {
+	var funcPos token.Position
+	if s.currentFuncPos.IsValid() {
+		funcPos = s.fs.Position(s.currentFuncPos)
+	}
 	s.errs = append(s.errs, compileError{
 		position: s.fs.Position(pos),
 		message:  str,
+		function: s.currentFunc,
+		funcPos:  funcPos,
 	})
 }
 
@@ -414,7 +458,9 @@ func (cs *compileState) parse(f *ast.File) {
 		}
 		n := fd.Name.Name
 
+		cs.currentFunc, cs.currentFuncPos = n, fd.Name.Pos()
 		inParams, outParams, ret := cs.parseFuncParams(&cs.global, n, fd)
+		cs.currentFunc, cs.currentFuncPos = "", 0
 
 		if n == cs.vertexEntry {
 			cs.vertexEntryPos = d.Pos()
@@ -690,7 +736,9 @@ func (cs *compileState) parseDecl(b *block, fname string, d ast.Decl) ([]shaderi
 			cs.addError(d.Pos(), "unexpected token")
 		}
 	case *ast.FuncDecl:
+		cs.currentFunc, cs.currentFuncPos = d.Name.Name, d.Name.Pos()
 		f, ok := cs.parseFunc(b, d)
+		cs.currentFunc, cs.currentFuncPos = "", 0
 		if !ok {
 			return nil, false
 		}

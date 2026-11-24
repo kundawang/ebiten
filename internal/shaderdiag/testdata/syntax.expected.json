@@ -1,0 +1,21 @@
+{
+  "errors": [
+    {
+      "code": "KAGE1001",
+      "stage": "parse",
+      "message": "hexadecimal literal has no digits",
+      "line": 5,
+      "column": 13,
+      "macroContext": "//kage:unit pixels"
+    },
+    {
+      "code": "KAGE1001",
+      "stage": "parse",
+      "message": "exponent has no digits",
+      "line": 7,
+      "column": 13,
+      "macroContext": "//kage:unit pixels"
+    }
+  ],
+  "truncated": 0
+}

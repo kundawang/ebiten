@@ -1,0 +1,15 @@
+//kage:unit pixels
+
+package main
+
+func f() vec4 {
+	return g()
+}
+
+func g() vec4 {
+	return f()
+}
+
+func Fragment(dstPos vec4, src0Pos vec2, color vec4) vec4 {
+	return f()
+}

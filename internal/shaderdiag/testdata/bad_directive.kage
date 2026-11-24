@@ -1,0 +1,7 @@
+//kage:unit bananas
+
+package main
+
+func Fragment(dstPos vec4, src0Pos vec2, color vec4) vec4 {
+	return color
+}

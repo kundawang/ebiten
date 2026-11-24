@@ -1,0 +1,11 @@
+{
+  "errors": [
+    {
+      "code": "KAGE0002",
+      "stage": "parse",
+      "message": "legacyshader: invalid value for //kage:unit: bananas",
+      "macroContext": "//kage:unit texels; the source is converted from texels to pixels and the deprecated builtin definitions are appended, so reported positions refer to the converted source"
+    }
+  ],
+  "truncated": 0
+}

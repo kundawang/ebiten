@@ -1,0 +1,13 @@
+//kage:unit pixels
+
+package main
+
+// 変換行列
+var M mat2
+
+func Fragment(dstPos vec4, src0Pos vec2, color vec4) vec4 {
+	var a [2]vec4
+	係数 := 2.0
+	m := 係数 * (M + a)
+	return color * m
+}

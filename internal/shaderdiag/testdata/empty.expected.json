@@ -1,0 +1,10 @@
+{
+  "errors": [
+    {
+      "code": "KAGE0001",
+      "stage": "parse",
+      "message": "the shader source is empty"
+    }
+  ],
+  "truncated": 0
+}

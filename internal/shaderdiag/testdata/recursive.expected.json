@@ -1,0 +1,21 @@
+{
+  "errors": [
+    {
+      "code": "KAGE2001",
+      "stage": "typecheck",
+      "message": "function f must not be called recursively",
+      "line": 5,
+      "column": 1,
+      "macroContext": "//kage:unit pixels"
+    },
+    {
+      "code": "KAGE2001",
+      "stage": "typecheck",
+      "message": "function g must not be called recursively",
+      "line": 9,
+      "column": 1,
+      "macroContext": "//kage:unit pixels"
+    }
+  ],
+  "truncated": 0
+}

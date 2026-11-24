@@ -1,0 +1,11 @@
+{
+  "errors": [
+    {
+      "code": "KAGE3001",
+      "stage": "ir",
+      "message": "graphics: fragment shader entry point 'Fragment' is missing",
+      "macroContext": "//kage:unit pixels"
+    }
+  ],
+  "truncated": 0
+}
