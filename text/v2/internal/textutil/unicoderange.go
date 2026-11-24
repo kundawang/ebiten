@@ -43,6 +43,19 @@ func (u *UnicodeRanges) Contains(r rune) bool {
 	return false
 }
 
+// Ranges returns a copy of the configured ranges as inclusive [start, end]
+// pairs, in the order they were added. The result does not alias u.
+func (u *UnicodeRanges) Ranges() [][2]rune {
+	if len(u.ranges) == 0 {
+		return nil
+	}
+	rs := make([][2]rune, len(u.ranges))
+	for i, rg := range u.ranges {
+		rs[i] = [2]rune{rg.start, rg.end}
+	}
+	return rs
+}
+
 func (u *UnicodeRanges) Filter(str string) string {
 	replaceStartIndex := -1
 	for i, r := range str {

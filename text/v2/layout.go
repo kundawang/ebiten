@@ -389,6 +389,43 @@ var theAppendGlyphsLazyBufPool = sync.Pool{
 
 // forEachLine iterates lines.
 func forEachLine(text string, face Face, options *LayoutOptions, f func(text string, indexOffset int, originX, originY float64)) {
+	layoutLines(text, face, options, func(line string, indexOffset int, originX, originY float64, _ lineLayoutInfo) {
+		f(line, indexOffset, originX, originY)
+	})
+}
+
+// lineLayoutInfo describes one line's placement in the layout coordinate
+// space, independent of any destination image.
+type lineLayoutInfo struct {
+	// index is the zero-based line number.
+	index int
+
+	// advance is the line's visual advance along the primary direction.
+	advance float64
+
+	// indexOffset is the byte offset of the line in the original text.
+	indexOffset int
+
+	// contentLen is the byte length of the line's content, excluding its
+	// terminator.
+	contentLen int
+
+	// originX and originY are the line's origin, including alignments.
+	originX, originY float64
+
+	// lineBreakLen is the byte length of the line terminator. It is 0 for
+	// the last line when the text does not end with a break.
+	lineBreakLen int
+
+	// boundaryWidth and boundaryHeight describe the whole text's rendering
+	// region. They are the same for every line.
+	boundaryWidth, boundaryHeight float64
+}
+
+// layoutLines iterates lines like forEachLine, additionally passing a
+// lineLayoutInfo. It performs the same placement arithmetic as forEachLine so
+// that a captured layout replays identically to Draw and AppendGlyphs.
+func layoutLines(text string, face Face, options *LayoutOptions, f func(text string, indexOffset int, originX, originY float64, info lineLayoutInfo)) {
 	if text == "" {
 		return
 	}
@@ -485,8 +522,19 @@ func forEachLine(text string, face Face, options *LayoutOptions, f func(text str
 		}
 
 		l := len(line)
-		line = textutil.TrimTailingLineBreak(line)
-		f(line, indexOffset, originX+offsetX, originY+offsetY)
+		trimmed := textutil.TrimTailingLineBreak(line)
+		info := lineLayoutInfo{
+			index:          i,
+			advance:        advances[i],
+			indexOffset:    indexOffset,
+			contentLen:     len(trimmed),
+			originX:        originX + offsetX,
+			originY:        originY + offsetY,
+			lineBreakLen:   l - len(trimmed),
+			boundaryWidth:  boundaryWidth,
+			boundaryHeight: boundaryHeight,
+		}
+		f(trimmed, indexOffset, originX+offsetX, originY+offsetY, info)
 
 		indexOffset += l
 		i++

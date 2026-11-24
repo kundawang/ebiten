@@ -328,6 +328,10 @@ type GoTextFaceSource struct {
 	metadata      Metadata
 	variationAxes []VariationAxis
 
+	// resourceHash is a digest of the font resource's tables. It is the
+	// content part of every fingerprint derived from this source.
+	resourceHash [32]byte
+
 	outputCache *cache[goTextOutputCacheKey, *goTextOutputCacheValue]
 
 	glyphImageCache glyphImageCaches
@@ -417,8 +421,9 @@ func toFontResource(source io.Reader) (font.Resource, error) {
 
 func newGoTextFaceSource(face *font.Face, loader *opentype.Loader) *GoTextFaceSource {
 	s := &GoTextFaceSource{
-		f:       face,
-		svgFont: loadSVGFont(loader),
+		f:            face,
+		svgFont:      loadSVGFont(loader),
+		resourceHash: fontResourceHash(loader),
 	}
 	s.addr = s
 	s.metadata = metadataFromFace(face)

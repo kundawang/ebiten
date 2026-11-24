@@ -51,6 +51,9 @@ type Face interface {
 
 	direction() Direction
 
+	// fingerprint identifies the face configuration for snapshots.
+	fingerprint() (FontFingerprint, error)
+
 	// private is an unexported function preventing being implemented by other packages.
 	private()
 }
@@ -402,6 +405,15 @@ const (
 func (d Direction) isHorizontal() bool {
 	switch d {
 	case DirectionLeftToRight, DirectionRightToLeft:
+		return true
+	}
+	return false
+}
+
+// isValid reports whether d is one of the defined directions.
+func (d Direction) isValid() bool {
+	switch d {
+	case DirectionLeftToRight, DirectionRightToLeft, DirectionTopToBottomAndLeftToRight, DirectionTopToBottomAndRightToLeft:
 		return true
 	}
 	return false
