@@ -31,12 +31,28 @@ type (
 		// stops them, so that a player reading an infinite source does not keep reading after its test.
 		players []*dummyPlayer
 
+		// rebuilds tracks the drivers a rebuild test installed, so that their players are stopped
+		// when the context is reset.
+		rebuilds []*dummyDriver
+
 		mu sync.Mutex
 	}
 	dummyPlayer struct {
 		r       io.Reader
 		playing bool
 		volume  float64
+
+		// buffered is the simulated device buffer fill in bytes reported by BufferedSize.
+		buffered int
+		// bufferSize is the value last passed to SetBufferSize.
+		bufferSize int
+
+		// readDelay delays each source read in a player's reading goroutine, to simulate a slow
+		// source. It is read under the player's mutex.
+		readDelay time.Duration
+
+		// reads counts the source reads, so a test can wait for the player to start reading.
+		reads int
 
 		// eof is whether the source has been exhausted by playing through. Like the real players,
 		// a player which has finished its source refuses to play until Seek resets this state.
@@ -77,6 +93,15 @@ func (d *dummyDriver) stopPlayers() {
 		p.PauseAndStopReading()
 		p.readers.Wait()
 	}
+}
+
+// takeRebuilds returns the drivers installed by RebuildDriverForTesting since the previous call.
+func (d *dummyDriver) takeRebuilds() []*dummyDriver {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rebuilds := d.rebuilds
+	d.rebuilds = nil
+	return rebuilds
 }
 
 func (d *dummyDriver) takePlayers() []*dummyPlayer {
@@ -150,7 +175,17 @@ func (p *dummyPlayer) readOnce(gen int, buf []byte) (stopped bool, err error) {
 	if p.readGen != gen {
 		return true, nil
 	}
+	if p.readDelay > 0 {
+		delay := p.readDelay
+		p.mu.Unlock()
+		time.Sleep(delay)
+		p.mu.Lock()
+		if p.readGen != gen {
+			return true, nil
+		}
+	}
 	_, err = p.r.Read(buf)
+	p.reads++
 	if err != nil && err != io.EOF {
 		p.err = err
 		p.playing = false
@@ -187,8 +222,8 @@ func (p *dummyPlayer) SetVolume(volume float64) {
 	p.volume = volume
 }
 
-// BufferedSize always reports an empty buffer, as the simulated device consumes the data as soon as
-// it is read.
+// BufferedSize reports the simulated device buffer fill. It is produced by the test through
+// SetBufferedSizeForTesting; the player itself does not model the fill.
 //
 // The context calls this exactly once per tick, before it reads the position and checks IsPlaying.
 // The player keeps playing for one more tick after its source is exhausted, so that the position
@@ -204,7 +239,7 @@ func (p *dummyPlayer) BufferedSize() int {
 		}
 		p.drained = true
 	}
-	return 0
+	return p.buffered
 }
 
 func (p *dummyPlayer) Err() error {
@@ -214,6 +249,9 @@ func (p *dummyPlayer) Err() error {
 }
 
 func (p *dummyPlayer) SetBufferSize(bufferSize int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bufferSize = bufferSize
 }
 
 func (p *dummyPlayer) Seek(offset int64, whence int) (int64, error) {
@@ -375,6 +413,9 @@ func ResetContextForTesting() {
 		c.close()
 	}
 	dummyDriverForTesting.stopPlayers()
+	for _, d := range dummyDriverForTesting.takeRebuilds() {
+		d.stopPlayers()
+	}
 }
 
 func takeContextForTesting() *Context {
@@ -389,8 +430,78 @@ func (i *InfiniteLoop) SetNoBlendForTesting(value bool) {
 	i.noBlendForTesting = value
 }
 
+// SetBufferedSizeForTesting sets the device buffer fill a simulated player reports, in bytes.
+func SetBufferedSizeForTesting(p *Player, buffered int) {
+	pi := p.p
+	pi.m.Lock()
+	defer pi.m.Unlock()
+	if pi.player == nil {
+		return
+	}
+	dp, ok := pi.player.(*dummyPlayer)
+	if !ok {
+		return
+	}
+	dp.mu.Lock()
+	defer dp.mu.Unlock()
+	dp.buffered = buffered
+}
+
+// VoiceIDForTesting returns the telemetry voice ID of the player's current underlying player.
+func VoiceIDForTesting(p *Player) int64 {
+	pi := p.p
+	pi.m.Lock()
+	defer pi.m.Unlock()
+	return pi.voiceID
+}
+
+// RebuildDriverForTesting replaces the context's driver with a fresh one, as a device rebuild
+// would, and returns the old driver. The players detect the change on the next update.
+//
+// The fresh driver's players are tracked so that ResetContextForTesting stops them too.
+func RebuildDriverForTesting() *dummyDriver {
+	f := CurrentContext().playerFactory
+	f.m.Lock()
+	old := f.driver.(*dummyDriver)
+	d := &dummyDriver{}
+	f.driver = d
+	f.m.Unlock()
+
+	dummyDriverForTesting.mu.Lock()
+	dummyDriverForTesting.rebuilds = append(dummyDriverForTesting.rebuilds, d)
+	dummyDriverForTesting.mu.Unlock()
+	return old
+}
+
 // NewTimeStreamForTesting returns the stream a Player reads from, over a seekable src in signed 16bit
 // integer stereo.
 func NewTimeStreamForTesting(src io.ReadSeeker, sampleRate int) (io.ReadSeeker, error) {
 	return newTimeStream(src, true, sampleRate, bitDepthInBytesInt16)
+}
+
+// AudioUnderrunTelemetryWithSampleRateForTesting returns a telemetry that interprets byte counts
+// with sampleRate, to exercise sample rate changes.
+func AudioUnderrunTelemetryWithSampleRateForTesting(sampleRate int) *AudioUnderrunTelemetry {
+	return newAudioUnderrunTelemetry(0, sampleRate, nil)
+}
+
+// SetClockForTesting replaces the telemetry's clock. f must be safe for concurrent use.
+func (t *AudioUnderrunTelemetry) SetClockForTesting(f func() time.Time) {
+	if f == nil {
+		t.clock.Store(nil)
+		return
+	}
+	c := audioUnderrunClock(f)
+	t.clock.Store(&c)
+}
+
+// SetEnabledForTesting enables collection without reporting errors, for tests that build a
+// telemetry by hand.
+func (t *AudioUnderrunTelemetry) SetEnabledForTesting(enabled bool) {
+	_ = t.SetEnabled(enabled)
+}
+
+// CloseForTesting finalizes the telemetry, as closing its player does.
+func (t *AudioUnderrunTelemetry) CloseForTesting() {
+	t.close()
 }

@@ -34,6 +34,10 @@
 // When multiple players play, mixing is automatically done.
 // Note that too many players may cause distortion.
 //
+// A player can report diagnostics for intermittent audio, such as underruns, slow source reads,
+// and device callbacks, through [Player.AudioUnderrunTelemetry]. The telemetry is disabled by
+// default; enabling it does not affect playback.
+//
 // For the simplest example to play sound, see the wav package in the examples.
 package audio
 
@@ -387,6 +391,17 @@ func (c *Context) SampleRate() int {
 type Player struct {
 	p       *playerImpl
 	cleanup runtime.Cleanup
+}
+
+// AudioUnderrunTelemetry returns the telemetry of this player.
+//
+// The telemetry is disabled by default. Enabling it with
+// [AudioUnderrunTelemetry.SetEnabled] makes the player record source reads, buffer fill levels,
+// device callbacks, position changes, and underruns. While it is disabled, playback timing and
+// volume are unaffected.
+func (p *Player) AudioUnderrunTelemetry() *AudioUnderrunTelemetry {
+	defer runtime.KeepAlive(p)
+	return p.p.telemetry
 }
 
 // NewPlayer creates a new player with the given stream.

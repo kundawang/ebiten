@@ -61,6 +61,13 @@ type playerFactory struct {
 
 var driverForTesting driver
 
+// nextPlayerID and nextVoiceID identify players and device voices across the process. Tests
+// create several contexts, so a per-context counter would not keep the IDs distinct.
+var (
+	nextPlayerID atomic.Int64
+	nextVoiceID  atomic.Int64
+)
+
 func newPlayerFactory(sampleRate int) *playerFactory {
 	return &playerFactory{
 		sampleRate: sampleRate,
@@ -68,15 +75,34 @@ func newPlayerFactory(sampleRate int) *playerFactory {
 }
 
 type playerImpl struct {
-	context        *Context
-	player         player
-	src            io.Reader
-	seekable       bool
-	srcIdent       any
-	stream         *timeStream
-	factory        *playerFactory
+	context  *Context
+	player   player
+	src      io.Reader
+	seekable bool
+	srcIdent any
+	stream   *timeStream
+	// deviceStream is the reader handed to the underlying player. It is stream, wrapped to
+	// collect the underrun telemetry.
+	deviceStream io.Reader
+	factory      *playerFactory
+	// voiceDriver is the driver the current underlying voice was created from. A driver change,
+	// e.g. after the audio device is rebuilt, is detected by comparing it with the factory's
+	// current driver.
+	voiceDriver driver
+	// voiceID identifies the current underlying voice for the telemetry, and is 0 before the
+	// voice exists.
+	voiceID        int64
 	initBufferSize int
+	// bufferSize is the byte size requested with SetBufferSize, and 0 when the driver's default
+	// is used.
+	bufferSize     int
 	bytesPerSample int
+
+	// lastDeviceErr is the device error last reported to the telemetry, so that polling Err on
+	// every sweep does not record the same failure repeatedly.
+	lastDeviceErr error
+
+	telemetry *AudioUnderrunTelemetry
 
 	// volume is the player's volume in the range of [0, math.MaxFloat32].
 	// The value is kept here so that a volume set before the underlying player is created is preserved.
@@ -117,6 +143,9 @@ func (f *playerFactory) newPlayer(context *Context, src io.Reader, seekable bool
 		bytesPerSample: bitDepthInBytes * channelCount,
 		volume:         1,
 	}
+	p.telemetry = newAudioUnderrunTelemetry(nextPlayerID.Add(1), f.sampleRate, func() int {
+		return p.factory.sampleRate
+	})
 	// AddCleanup is not set for p. The caller of newPlayer should set a finalizer for p's wrapper.
 	return p, nil
 }
@@ -197,6 +226,11 @@ func (p *playerImpl) ensureStream() error {
 		return err
 	}
 	p.stream = s
+	r := &audioUnderrunReadSeeker{r: s, t: p.telemetry}
+	if lc := findLoopCounter(p.src); lc != nil {
+		r.loops = lc
+	}
+	p.deviceStream = r
 	return nil
 }
 
@@ -206,26 +240,61 @@ func (p *playerImpl) ensureStream() error {
 // backend is initialized. Until then ensurePlayer leaves the underlying player nil, and the
 // caller must record the requested operation (play, volume, position) to apply once the device
 // is created.
+//
+// If the factory's driver changed since the voice was created, the old voice is discarded and a
+// new one is created from the new driver; the telemetry records this as a device rebuild.
 func (p *playerImpl) ensurePlayer() error {
 	if err := p.ensureStream(); err != nil {
 		return err
-	}
-	if p.player != nil {
-		return nil
 	}
 
 	d := p.factory.currentDriver()
 	if d == nil {
 		return nil
 	}
+	if p.player != nil && p.voiceDriver == d {
+		return nil
+	}
 
-	pl := d.NewPlayer(p.stream)
+	var previousVoiceID int64
+	var wasPlaying bool
+	var buffered int
+	if p.player != nil {
+		// The device was rebuilt. The data buffered in the old voice is gone.
+		previousVoiceID = p.voiceID
+		oldPlayer := p.player
+		wasPlaying = oldPlayer.IsPlaying()
+		oldPlayer.PauseAndStopReading()
+		buffered = oldPlayer.BufferedSize()
+		if closer, ok := oldPlayer.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		p.player = nil
+		p.stopwatch.stop()
+	}
+
+	pl := d.NewPlayer(p.deviceStream)
 	if p.initBufferSize != 0 {
 		pl.SetBufferSize(p.initBufferSize)
 		p.initBufferSize = 0
 	}
 	pl.SetVolume(p.volume)
 	p.player = pl
+	p.voiceDriver = d
+	p.voiceID = nextVoiceID.Add(1)
+	p.telemetry.setVoice(p.voiceID)
+	p.telemetry.setBufferSize(p.bufferSize)
+	if previousVoiceID != 0 {
+		// Report the rebuild with the new voice ID so that the event carries both the replaced
+		// voice and the replacement.
+		p.telemetry.recordDeviceRebuild(previousVoiceID, buffered)
+		if wasPlaying {
+			// A player that was playing keeps playing on the new voice. The new voice has no
+			// buffered data yet, so the position stays where the old voice left it until the
+			// device consumes the new data.
+			p.playAndStartStopwatch()
+		}
+	}
 	return nil
 }
 
@@ -263,8 +332,15 @@ func (p *playerImpl) startIfPending() error {
 // nothing is played.
 // playAndStartStopwatch must be called with p.m locked.
 func (p *playerImpl) playAndStartStopwatch() {
+	// Query the playing state only when it is needed, so that the disabled telemetry adds no
+	// device calls to Play.
+	recordResume := p.telemetry.Enabled()
+	wasPlaying := recordResume && p.player.IsPlaying()
 	p.player.Play()
 	if p.player.IsPlaying() {
+		if recordResume && !wasPlaying {
+			p.telemetry.recordResume(p.player.BufferedSize())
+		}
 		p.stopwatch.start()
 	}
 }
@@ -328,6 +404,7 @@ func (p *playerImpl) Pause() {
 	p.player.Pause()
 	p.context.removePlayingPlayer(p)
 	p.stopwatch.stop()
+	p.telemetry.recordPause(false, p.player.BufferedSize())
 }
 
 func (p *playerImpl) PauseAndStopReading() {
@@ -354,6 +431,7 @@ func (p *playerImpl) PauseAndStopReading() {
 	p.player.PauseAndStopReading()
 	p.context.removePlayingPlayer(p)
 	p.stopwatch.stop()
+	p.telemetry.recordPause(true, p.player.BufferedSize())
 }
 
 func (p *playerImpl) IsPlaying() bool {
@@ -438,6 +516,7 @@ func (p *playerImpl) Close() error {
 		}
 		p.stopwatch.stop()
 	}
+	p.telemetry.close()
 	return nil
 }
 
@@ -475,6 +554,7 @@ func (p *playerImpl) SetPosition(offset time.Duration) error {
 			return addErrorInfo(err)
 		}
 		p.afterSeek()
+		p.telemetry.recordSeek(offset, p.player.BufferedSize())
 		return nil
 	}
 
@@ -501,6 +581,9 @@ func (p *playerImpl) SetPosition(offset time.Duration) error {
 		}
 	}
 	p.afterSeek()
+	// Record the seek even though the device is not created yet: the position change is
+	// observable through the player's Position, and the event carries VoiceID 0.
+	p.telemetry.recordSeek(offset, 0)
 	return nil
 }
 
@@ -512,6 +595,7 @@ func (p *playerImpl) afterSeek() {
 	if p.isPlaying() {
 		p.stopwatch.start()
 	}
+	p.telemetry.noteSeekState()
 }
 
 func (p *playerImpl) Err() error {
@@ -521,7 +605,13 @@ func (p *playerImpl) Err() error {
 	if p.player == nil {
 		return nil
 	}
-	return addErrorInfo(p.player.Err())
+	err := addErrorInfo(p.player.Err())
+	// The context polls Err on every sweep; record a failure once, not once per poll.
+	if err != nil && !errors.Is(err, p.lastDeviceErr) {
+		p.lastDeviceErr = err
+		p.telemetry.recordDeviceError(err)
+	}
+	return err
 }
 
 func (p *playerImpl) SetBufferSize(bufferSize time.Duration) {
@@ -534,6 +624,8 @@ func (p *playerImpl) SetBufferSize(bufferSize time.Duration) {
 	}
 
 	sizeInBytes := bufferSizeInBytes(bufferSize, p.bytesPerSample, p.factory.sampleRate)
+	p.bufferSize = sizeInBytes
+	p.telemetry.setBufferSize(sizeInBytes)
 	if p.player == nil {
 		p.initBufferSize = sizeInBytes
 		return
@@ -567,6 +659,7 @@ func (p *playerImpl) onContextSuspended() {
 		return
 	}
 	p.stopwatch.stop()
+	p.telemetry.recordDeviceSuspend(p.player.BufferedSize())
 }
 
 func (p *playerImpl) onContextResumed() {
@@ -579,6 +672,7 @@ func (p *playerImpl) onContextResumed() {
 	if p.isPlaying() {
 		p.stopwatch.start()
 	}
+	p.telemetry.recordDeviceResume(p.player.BufferedSize())
 }
 
 func (p *playerImpl) updatePosition() {
@@ -590,11 +684,29 @@ func (p *playerImpl) updatePosition() {
 		// SetPosition (0 by default) until the player starts.
 		return
 	}
+	// A playing player's Play is not called again, so the voice has to notice a rebuilt device
+	// here rather than when the next player is created.
+	if p.factory.currentDriver() != p.voiceDriver {
+		if err := p.ensurePlayer(); err != nil {
+			p.context.setError(err)
+			return
+		}
+		if p.player == nil {
+			return
+		}
+	}
 	if !p.context.IsReady() {
 		return
 	}
 
-	samples := (p.stream.position() - int64(p.player.BufferedSize())) / int64(p.bytesPerSample)
+	// The stream is ahead of the device by the buffered data, so the fill level and the playing
+	// state together tell whether the device ran dry.
+	buffered := p.player.BufferedSize()
+	if p.telemetry.Enabled() {
+		p.telemetry.observeTick(p.player.IsPlaying(), buffered, p.bufferSize, p.voiceID)
+	}
+
+	samples := (p.stream.position() - int64(buffered)) / int64(p.bytesPerSample)
 
 	var adjustingTime time.Duration
 	if p.lastSamples >= 0 && p.lastSamples == samples {

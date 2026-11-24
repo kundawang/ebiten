@@ -46,6 +46,12 @@ type float32BytesReader struct {
 	i16Buf []byte
 }
 
+// UnwrapReader returns the source reader this reader converts. It lets the audio package find
+// the loop counter of a wrapped source.
+func (r *float32BytesReader) UnwrapReader() io.Reader {
+	return r.r
+}
+
 func (r *float32BytesReader) Read(buf []byte) (int, error) {
 	if r.eof && len(r.i16Buf) < int16SampleSize {
 		return 0, io.EOF

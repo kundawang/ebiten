@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync/atomic"
 )
 
 // InfiniteLoop represents a looped stream which never ends as long as its source has data to loop.
@@ -46,6 +47,10 @@ type InfiniteLoop struct {
 	blending bool
 
 	noBlendForTesting bool
+
+	// pendingLoops is the number of wraps since the last report. The telemetry of the player
+	// reading this loop drains it.
+	pendingLoops atomic.Uint64
 }
 
 // NewInfiniteLoop creates a new infinite loop stream with a source stream and length in bytes.
@@ -354,7 +359,44 @@ func (i *InfiniteLoop) rewind() error {
 	i.pos = i.lstart
 	i.extra = i.extra[:0]
 	i.partialAfterLoop = nil
+	i.pendingLoops.Add(1)
 	return nil
+}
+
+// takeLoops returns the number of wraps since the previous call.
+func (i *InfiniteLoop) takeLoops() uint64 {
+	return i.pendingLoops.Swap(0)
+}
+
+// loopCounter is a source that reports its wraps.
+type loopCounter interface {
+	takeLoops() uint64
+}
+
+// readerUnwrapper is a reader that wraps another reader, like the float32 converter does for a
+// 16bit source.
+type readerUnwrapper interface {
+	UnwrapReader() io.Reader
+}
+
+// findLoopCounter returns the loop counter of src, or nil if src does not loop. A looped source
+// is wrapped in more than one InfiniteLoop, and only the outermost one wraps, so the outermost
+// counter found by unwrapping the streaming layers is returned.
+func findLoopCounter(src io.Reader) loopCounter {
+	for {
+		switch r := src.(type) {
+		case loopCounter:
+			return r
+		case *timeStream:
+			src = r.r
+		case *audioUnderrunReadSeeker:
+			src = r.r
+		case readerUnwrapper:
+			src = r.UnwrapReader()
+		default:
+			return nil
+		}
+	}
 }
 
 // Seek is an implementation of ReadSeeker's Seek.
